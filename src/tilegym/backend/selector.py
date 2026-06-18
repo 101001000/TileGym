@@ -8,7 +8,10 @@ Used to manage backend implementations of various operations in TileGym library
 """
 
 import functools
+import importlib.util
 import os
+import shutil
+from pathlib import Path
 from typing import Dict
 from typing import Set
 
@@ -17,20 +20,48 @@ from tilegym.logger import get_logger
 logger = get_logger(__name__)
 
 try:
+    import torch
     import cuda.tile as ct
 
-    CUTILE_AVAILABLE = True
+    def _has_cutile_gpu() -> bool:
+        if not torch.cuda.is_available():
+            return False
+
+        for device_id in range(torch.cuda.device_count()):
+            major, _minor = torch.cuda.get_device_capability(device_id)
+
+            # Blackwell GPUs use compute capability 10.x or 12.x.
+            if major in (10, 12):
+                return True
+
+        return False
+
+    CUTILE_AVAILABLE = _has_cutile_gpu()
 
 except ImportError:
-    import warnings
-
-    warnings.warn("Failed to import cuda_tile_compiler, CUDA Tile backend is not available")
+    ct = None
     CUTILE_AVAILABLE = False
 
 
 def is_cutile_available():
     return CUTILE_AVAILABLE
 
+
+def _find_sptile_translate() -> Path | None:
+    translator = os.environ.get("SPTILES_TRANSLATE_BIN")
+    if translator:
+        candidate = Path(translator).expanduser()
+        if candidate.is_file():
+            return candidate
+
+    resolved = shutil.which("sp_tiles_translate")
+    return Path(resolved) if resolved else None
+
+
+def is_sptile_available() -> bool:
+    if importlib.util.find_spec("kp") is None:
+        return False
+    return _find_sptile_translate() is not None
 
 _TILECPP_MIN_NVCC = (13, 3)
 
@@ -135,6 +166,7 @@ def _check_backends_availability() -> Dict[str, bool]:
     availability = {
         "cutile": is_cutile_available(),
         "tilecpp": _TILECPP_MODULE_IMPORTABLE,
+        "sptile": is_sptile_available(),
     }
     return availability
 

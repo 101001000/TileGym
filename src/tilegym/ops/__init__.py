@@ -29,6 +29,20 @@ from . import moe_interface
 if is_backend_available("tilecpp"):
     from . import tilecpp
 
+if is_backend_available("sptile"):
+    try:
+        from . import sptile
+    except (ImportError, RuntimeError) as err:
+        import warnings
+
+        warnings.warn(
+            "spTiles backend import failed, sptile operations will not be available: "
+            f"{err}",
+        )
+        sptile = None  # type: ignore
+else:
+    sptile = None  # type: ignore
+
 # Re-export key interfaces
 from .attn_interface import attention_sink_interface
 from .attn_interface import fmha_interface
@@ -64,3 +78,7 @@ __all__ = [
 # Add cutile to exports only if successfully imported
 if cutile is not None:
     __all__.append("cutile")
+
+# Add sptile to exports only if successfully imported
+if sptile is not None:
+    __all__.append("sptile")

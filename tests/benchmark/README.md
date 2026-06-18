@@ -28,6 +28,15 @@ Execute the specific Python file, for example:
 python bench_matrix_multiplication.py
 ```
 
+Some benchmarks support a shared profiling mode override:
+```bash
+TILEGYM_BENCH_PROFILE_MODE=triton python bench_matrix_multiplication.py
+```
+The default is `wall`; supported values are `triton`, `triton_cudagraph`, `wall`, and `l2flush`.
+The matrix multiplication benchmark prepares `sptile` inputs outside the timed region by default,
+so it measures Kompute dispatch time rather than CUDA-to-CPU staging or result readback. Set
+`TILEGYM_SPTILE_PREPARED_BENCHMARK=0` to benchmark the full end-to-end `sptile.matmul` call.
+
 Available benchmark scripts:
 - `bench_bmm.py`
 - `bench_dropout.py`
