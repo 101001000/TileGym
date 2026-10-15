@@ -12,6 +12,9 @@ from tilegym.experimental import experimental_kernel
 
 from .utils import next_power_of_2
 
+from functools import lru_cache
+from .translator import prepare_triton_kernel, invoke_triton_kernel
+
 PAD_ZERO = ct.PaddingMode.ZERO
 
 
@@ -24,13 +27,32 @@ def _silu(x):
     return x * _sigmoid(x)
 
 
+@lru_cache(maxsize=None)
+def _prepare_swiglu_forward(n_rows, n_cols, dtype, device):
+    a = torch.empty((n_rows, n_cols), dtype=dtype, device=device)
+    b = torch.empty_like(a)
+    c = torch.empty_like(a)
+
+    TILE_SIZE = next_power_of_2(n_cols)
+    check_bounds = TILE_SIZE != n_cols
+    major, minor = torch.cuda.get_device_capability(device)
+
+    return prepare_triton_kernel(
+        _swiglu_forward_kernel,
+        (a, b, c, TILE_SIZE, check_bounds),
+        f"sm_{major}{minor}",
+        f"swiglu_{device.index}_{n_rows}_{n_cols}_{dtype}",
+    )
+
 @ct.kernel(occupancy=1, num_worker_warps=8)
 def _swiglu_forward_kernel(a, b, c, TILE_SIZE: ct.Constant[int], check_bounds: ct.Constant[bool]):
     row = ct.bid(0)
     offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
 
-    a_tile = ct.gather(a, (row, offsets), check_bounds=check_bounds, padding_value=0.0)
-    b_tile = ct.gather(b, (row, offsets), check_bounds=check_bounds, padding_value=0.0)
+    mask = ct.full((TILE_SIZE,), True, dtype=ct.bool_)
+
+    a_tile = ct.gather(a, (row, offsets), mask=mask, check_bounds=check_bounds, padding_value=0.0)
+    b_tile = ct.gather(b, (row, offsets), mask=mask, check_bounds=check_bounds, padding_value=0.0)
 
     a_tile_f32 = a_tile.astype(ct.float32)
     c_tile = _silu(a_tile_f32).astype(a.dtype) * b_tile
@@ -75,7 +97,7 @@ def _ceildiv(a, b):
     return -(a // -b)
 
 
-def _swiglu_forward(a, b):
+def _swiglu_forward(a, b, use_triton=False):
     """
     a: (batch_size, seq_len, intermediate_size)
     b: (batch_size, seq_len, intermediate_size)
@@ -92,18 +114,27 @@ def _swiglu_forward(a, b):
     # (every lane in-bounds); irregular shapes keep masking on the partial tile.
     check_bounds = TILE_SIZE != n_cols
     grid = (n_rows,)
-    ct.launch(
-        torch.cuda.current_stream(),
-        grid,
-        _swiglu_forward_kernel,
-        (
-            a,
-            b,
-            c,
-            TILE_SIZE,
-            check_bounds,
-        ),
-    )
+
+    kernel_args = (a, b, c, TILE_SIZE, check_bounds)
+
+    if use_triton:
+        kernel = _prepare_swiglu_forward(n_rows, n_cols, a.dtype, a.device)
+
+        invoke_triton_kernel(
+            kernel,
+            (n_rows, 1, 1),
+            a, *a.shape, *a.stride(),
+            b, *b.shape, *b.stride(),
+            c, *c.shape, *c.stride(),
+        )
+    else:
+        ct.launch(
+            torch.cuda.current_stream(),
+            grid,
+            _swiglu_forward_kernel,
+            kernel_args,
+        )
+
     return c.view(*ori_shape)
 
 

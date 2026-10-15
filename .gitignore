@@ -177,3 +177,8 @@ cython_debug/
 **/node_modules/
 
 **/sandbox/
+
+*.mlir
+*.txt
+*.ttir
+*.tilebc
