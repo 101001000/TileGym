@@ -9,6 +9,7 @@ Used to manage backend implementations of various operations in TileGym library
 
 import functools
 import os
+import shutil
 from typing import Dict
 from typing import Set
 
@@ -49,6 +50,24 @@ def is_cutile_available():
         print("[TileGym] TILEGYM_DISABLE_CUTILE=1; CUDA Tile backend force-disabled")
         return False
     return CUTILE_AVAILABLE
+
+
+_TILETRANSLATION_TOOLS = ("cuda-tile-translate", "triton-cuda-tile-opt")
+
+
+def is_tiletranslation_available() -> bool:
+    """Check if the cuTile -> Triton translation backend is available.
+
+    Requires the cuTile package (source kernels), triton (target), and the
+    translation toolchain binaries on PATH.
+    """
+    if not CUTILE_AVAILABLE:
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return all(shutil.which(tool) is not None for tool in _TILETRANSLATION_TOOLS)
 
 
 _TILECPP_MIN_NVCC = (13, 3)
@@ -191,6 +210,7 @@ def _check_backends_availability() -> Dict[str, bool]:
         "triton": True,
         "tilecpp": _TILECPP_MODULE_IMPORTABLE,
         "cutile-rs": is_cutile_rs_available(),
+        "tiletranslation": is_tiletranslation_available(),
     }
     return availability
 

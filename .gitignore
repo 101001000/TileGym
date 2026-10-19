@@ -182,3 +182,4 @@ cython_debug/
 *.txt
 *.ttir
 *.tilebc
+venv_tilegym/

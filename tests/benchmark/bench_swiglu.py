@@ -9,9 +9,28 @@ import triton
 import tilegym
 from tilegym.backend import is_backend_available
 from tilegym.backend import register_impl
+from torch.profiler import profile, ProfilerActivity
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+
+def do_bench_cuda(fn, n_repeat=20):
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(n_repeat):
+            fn()
+        torch.cuda.synchronize()
+
+    gpu_time_us = sum(
+        event.device_time_total
+        for event in prof.events()
+        if event.device_type.name == "CUDA"
+    )
+
+    return gpu_time_us / n_repeat / 1000.0
 
 def reference_swiglu(a: torch.Tensor, b: torch.Tensor):
     """Reference implementation of SwiGLU using vanilla PyTorch"""
@@ -30,6 +49,7 @@ register_impl("get_swiglu", "torch")(get_reference_swiglu)
 ALL_BACKENDS = [
     ("cutile", "CuTile", ("blue", "-")) if is_backend_available("cutile") else None,
     ("tilecpp", "TileCpp", ("purple", "-")) if is_backend_available("tilecpp") else None,
+    ("tiletranslation", "TileTranslation", ("orange", "-")) if is_backend_available("tiletranslation") else None,
     ("torch", "PyTorch", ("green", "-")),
 ]
 
@@ -96,7 +116,7 @@ def bench_swiglu(
     torch.testing.assert_close(fn(), ref(), atol=atol, rtol=rtol)
 
     # Benchmark the function
-    ms = triton.testing.do_bench_cudagraph(fn)
+    ms = do_bench_cuda(fn)
 
     # Calculate memory bandwidth (GB/s)
     # SwiGLU operation: F.silu(a) * b

@@ -57,6 +57,25 @@ if is_backend_available("cutile-rs"):
 else:
     cutile_rs = None  # type: ignore
 
+# Import tiletranslation (cuTile -> Triton) backend if available
+if is_backend_available("tiletranslation"):
+    try:
+        from . import tiletranslation
+    except (ImportError, RuntimeError):
+        import warnings
+
+        warnings.warn(
+            "tiletranslation backend import failed, tiletranslation operations will not be available",
+            stacklevel=2,
+        )
+        tiletranslation = None  # type: ignore
+        # Backend isn't usable if its ops failed to import — keep the selector in sync.
+        from tilegym.backend.selector import _AVAILABLE_BACKENDS
+
+        _AVAILABLE_BACKENDS.discard("tiletranslation")
+else:
+    tiletranslation = None  # type: ignore
+
 # Re-export key interfaces
 from .attn_interface import attention_sink_interface
 from .attn_interface import fmha_interface
@@ -92,3 +111,7 @@ if cutile is not None:
 # Add tilecpp to exports only if it was imported above
 if is_backend_available("tilecpp"):
     __all__.append("tilecpp")
+
+# Add tiletranslation to exports only if it was imported above
+if tiletranslation is not None:
+    __all__.append("tiletranslation")
