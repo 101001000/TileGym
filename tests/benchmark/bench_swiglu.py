@@ -19,16 +19,24 @@ def do_bench_cuda(fn, n_repeat=20):
         fn()
     torch.cuda.synchronize()
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        for _ in range(n_repeat):
-            fn()
-        torch.cuda.synchronize()
+    # The first CUPTI/profiler session in a process can report no CUDA events
+    # (profiler warmup), yielding gpu_time_us == 0. Retry in that case.
+    gpu_time_us = 0
+    for _ in range(5):
+        if gpu_time_us > 0:
+            break
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            for _ in range(n_repeat):
+                fn()
+            torch.cuda.synchronize()
 
-    gpu_time_us = sum(
-        event.device_time_total
-        for event in prof.events()
-        if event.device_type.name == "CUDA"
-    )
+        gpu_time_us = sum(
+            event.device_time_total
+            for event in prof.events()
+            if event.device_type.name == "CUDA"
+        )
+    if gpu_time_us == 0:
+        raise RuntimeError("profiler reported no CUDA kernel time")
 
     return gpu_time_us / n_repeat / 1000.0
 
@@ -50,6 +58,7 @@ ALL_BACKENDS = [
     ("cutile", "CuTile", ("blue", "-")) if is_backend_available("cutile") else None,
     ("tilecpp", "TileCpp", ("purple", "-")) if is_backend_available("tilecpp") else None,
     ("tiletranslation", "TileTranslation", ("orange", "-")) if is_backend_available("tiletranslation") else None,
+    ("droptokens", "DropTokens", ("red", "-")) if is_backend_available("droptokens") else None,
     ("torch", "PyTorch", ("green", "-")),
 ]
 

@@ -76,6 +76,25 @@ if is_backend_available("tiletranslation"):
 else:
     tiletranslation = None  # type: ignore
 
+# Import droptokens (cuTile IR + cuda-tile-drop-tokens pass) backend if available
+if is_backend_available("droptokens"):
+    try:
+        from . import droptokens
+    except (ImportError, RuntimeError):
+        import warnings
+
+        warnings.warn(
+            "droptokens backend import failed, droptokens operations will not be available",
+            stacklevel=2,
+        )
+        droptokens = None  # type: ignore
+        # Backend isn't usable if its ops failed to import — keep the selector in sync.
+        from tilegym.backend.selector import _AVAILABLE_BACKENDS
+
+        _AVAILABLE_BACKENDS.discard("droptokens")
+else:
+    droptokens = None  # type: ignore
+
 # Re-export key interfaces
 from .attn_interface import attention_sink_interface
 from .attn_interface import fmha_interface
@@ -115,3 +134,7 @@ if is_backend_available("tilecpp"):
 # Add tiletranslation to exports only if it was imported above
 if tiletranslation is not None:
     __all__.append("tiletranslation")
+
+# Add droptokens to exports only if it was imported above
+if droptokens is not None:
+    __all__.append("droptokens")

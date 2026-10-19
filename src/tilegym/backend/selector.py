@@ -54,6 +54,21 @@ def is_cutile_available():
 
 _TILETRANSLATION_TOOLS = ("cuda-tile-translate", "triton-cuda-tile-opt")
 
+_DROPTOKENS_TOOLS = ("cuda-tile-translate", "triton-cuda-tile-opt")
+
+
+def is_droptokens_available() -> bool:
+    """Check if the drop-tokens cuTile IR backend is available.
+
+    Runs the ``cuda-tile-drop-tokens`` pass (from the cuTile translation
+    toolchain) over the kernel's cuTile IR and executes the resulting cuTile
+    IR through cuda.tile's native launch path. Requires the cuTile package
+    and the translation toolchain binaries on PATH (no triton needed).
+    """
+    if not CUTILE_AVAILABLE:
+        return False
+    return all(shutil.which(tool) is not None for tool in _DROPTOKENS_TOOLS)
+
 
 def is_tiletranslation_available() -> bool:
     """Check if the cuTile -> Triton translation backend is available.
@@ -211,6 +226,7 @@ def _check_backends_availability() -> Dict[str, bool]:
         "tilecpp": _TILECPP_MODULE_IMPORTABLE,
         "cutile-rs": is_cutile_rs_available(),
         "tiletranslation": is_tiletranslation_available(),
+        "droptokens": is_droptokens_available(),
     }
     return availability
 
