@@ -18,6 +18,7 @@ from tilegym.backend import register_impl
 from tilegym.ops.cutile.swiglu import _swiglu_forward_kernel
 from tilegym.ops.cutile.utils import next_power_of_2
 
+from .translator import get_sm_arch
 from .translator import invoke_triton_kernel
 from .translator import prepare_triton_kernel
 
@@ -30,12 +31,11 @@ def _prepare_swiglu_forward(n_rows, n_cols, dtype, device):
 
     TILE_SIZE = next_power_of_2(n_cols)
     check_bounds = TILE_SIZE != n_cols
-    major, minor = torch.cuda.get_device_capability(device)
 
     return prepare_triton_kernel(
         _swiglu_forward_kernel,
         (a, b, c, TILE_SIZE, check_bounds),
-        f"sm_{major}{minor}",
+        get_sm_arch(),
         f"swiglu_{device.index}_{n_rows}_{n_cols}_{dtype}",
     )
 

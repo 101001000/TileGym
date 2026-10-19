@@ -1,7 +1,21 @@
+import os
 import subprocess
 import triton
 
 from cuda.tile.compilation import CallingConvention, KernelSignature, export_kernel
+
+DEFAULT_SM_ARCH = "sm_120"
+
+
+def get_sm_arch() -> str:
+    """Target GPU architecture for the translation pipeline.
+
+    Read from the ``TILEGYM_SM_ARCH`` environment variable (e.g. ``sm_120``),
+    defaulting to ``sm_120``. Kept out of the per-op prepare paths so the
+    target is a pipeline-level decision rather than derived from the current
+    device at each call site.
+    """
+    return os.environ.get("TILEGYM_SM_ARCH", DEFAULT_SM_ARCH)
 
 def validate_mlir(mlir_path):
     subprocess.run(
