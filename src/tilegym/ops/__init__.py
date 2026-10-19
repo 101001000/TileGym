@@ -25,13 +25,17 @@ else:
 
 from . import moe_interface
 
-# Make triton optional - only import if the library is available
-try:
-    from . import triton
-except (ImportError, RuntimeError):
-    import warnings
+# Make triton optional - only import if the backend is enabled
+# (disabled by default; set TILEGYM_ENABLE_TRITON=1 to opt in)
+if is_backend_available("triton"):
+    try:
+        from . import triton
+    except (ImportError, RuntimeError):
+        import warnings
 
-    warnings.warn("Triton backend import failed, triton operations will not be available")
+        warnings.warn("Triton backend import failed, triton operations will not be available")
+        triton = None  # type: ignore
+else:
     triton = None  # type: ignore
 
 # Import CUDA Tile C++ backend if available

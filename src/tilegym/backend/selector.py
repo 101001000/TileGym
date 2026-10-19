@@ -13,6 +13,8 @@ import shutil
 from typing import Dict
 from typing import Set
 
+import torch
+
 from tilegym.logger import get_logger
 
 logger = get_logger(__name__)
@@ -54,6 +56,14 @@ def is_cutile_available():
         and torch.cuda.is_available()
         and torch.version.cuda is not None
     )
+
+
+def is_triton_available() -> bool:
+    """Check if the Triton backend is available.
+
+    Disabled by default; set ``TILEGYM_ENABLE_TRITON=1`` to opt back in.
+    """
+    return os.environ.get("TILEGYM_ENABLE_TRITON", "0") == "1"
 
 
 _TILETRANSLATION_TOOLS = ("cuda-tile-translate", "triton-cuda-tile-opt")
@@ -226,7 +236,7 @@ _CURRENT_BACKENDS: str = "cutile"
 def _check_backends_availability() -> Dict[str, bool]:
     availability = {
         "cutile": is_cutile_available(),
-        "triton": True,
+        "triton": is_triton_available(),
         "tilecpp": _TILECPP_MODULE_IMPORTABLE,
         "cutile-rs": is_cutile_rs_available(),
         "tiletranslation": is_tiletranslation_available(),
