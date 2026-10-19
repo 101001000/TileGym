@@ -36,7 +36,8 @@ def _prepare_swiglu_forward(n_rows, n_cols, dtype, device):
         _swiglu_forward_kernel,
         (a, b, c, TILE_SIZE, check_bounds),
         get_sm_arch(),
-        f"swiglu_{device.index}_{n_rows}_{n_cols}_{dtype}",
+        "swiglu",
+        f"{device.index}_{n_rows}_{n_cols}_{dtype}",
     )
 
 

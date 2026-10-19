@@ -9,36 +9,9 @@ import triton
 import tilegym
 from tilegym.backend import is_backend_available
 from tilegym.backend import register_impl
-from torch.profiler import profile, ProfilerActivity
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-
-def do_bench_cuda(fn, n_repeat=20):
-    for _ in range(5):
-        fn()
-    torch.cuda.synchronize()
-
-    # The first CUPTI/profiler session in a process can report no CUDA events
-    # (profiler warmup), yielding gpu_time_us == 0. Retry in that case.
-    gpu_time_us = 0
-    for _ in range(5):
-        if gpu_time_us > 0:
-            break
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            for _ in range(n_repeat):
-                fn()
-            torch.cuda.synchronize()
-
-        gpu_time_us = sum(
-            event.device_time_total
-            for event in prof.events()
-            if event.device_type.name == "CUDA"
-        )
-    if gpu_time_us == 0:
-        raise RuntimeError("profiler reported no CUDA kernel time")
-
-    return gpu_time_us / n_repeat / 1000.0
 
 def reference_swiglu(a: torch.Tensor, b: torch.Tensor):
     """Reference implementation of SwiGLU using vanilla PyTorch"""
@@ -71,7 +44,7 @@ def get_supported_backends():
 def create_benchmark_config(batch_size, M, dtype):
     """Create a benchmark configuration for given parameters"""
     available_backends = get_supported_backends()
-    if not available_backends:
+    if not F:
         return None
 
     backends, names, styles = zip(*available_backends)
@@ -125,7 +98,7 @@ def bench_swiglu(
     torch.testing.assert_close(fn(), ref(), atol=atol, rtol=rtol)
 
     # Benchmark the function
-    ms = do_bench_cuda(fn)
+    ms = triton.testing.do_bench(fn)
 
     # Calculate memory bandwidth (GB/s)
     # SwiGLU operation: F.silu(a) * b

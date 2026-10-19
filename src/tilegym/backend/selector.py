@@ -47,9 +47,13 @@ except ImportError:
 
 def is_cutile_available():
     if os.environ.get("TILEGYM_DISABLE_CUTILE") == "1":
-        print("[TileGym] TILEGYM_DISABLE_CUTILE=1; CUDA Tile backend force-disabled")
         return False
-    return CUTILE_AVAILABLE
+
+    return (
+        CUTILE_AVAILABLE
+        and torch.cuda.is_available()
+        and torch.version.cuda is not None
+    )
 
 
 _TILETRANSLATION_TOOLS = ("cuda-tile-translate", "triton-cuda-tile-opt")
