@@ -55,13 +55,19 @@ class _DropTokensKernel(ct.kernel):
             return_cubin=False,
         )
         [kernel_sig] = result.kernel_signatures
+        # The 4th element's contract differs across cuda.tile versions and is
+        # validated strictly at launch: 1.6 expects `list|None`, 1.7+
+        # expects `tuple(library_lifecycle_providers)`. Mirror whichever the
+        # running version's CompilationResult carries.
+        providers = getattr(result, "library_lifecycle_providers", None)
+        modules = [] if providers is None else tuple(providers)
         cubin = drop_tokens_cubin(
             result.bytecode,
             sm_arch,
             self._compiler_options,
             context.config.compiler_timeout_sec,
         )
-        return cubin, kernel_sig.symbol, None, []
+        return cubin, kernel_sig.symbol, None, modules
 
 
 # Same underlying kernel and compiler options as the cutile backend's

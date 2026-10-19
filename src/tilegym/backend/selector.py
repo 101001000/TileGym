@@ -76,10 +76,16 @@ def is_droptokens_available() -> bool:
 
     Runs the ``cuda-tile-drop-tokens`` pass (from the cuTile translation
     toolchain) over the kernel's cuTile IR and executes the resulting cuTile
-    IR through cuda.tile's native launch path. Requires the cuTile package
-    and the translation toolchain binaries on PATH (no triton needed).
+    IR through cuda.tile's native launch path. The result is a cubin for the
+    target sm architecture, so execution requires an NVIDIA GPU — the backend
+    is therefore disabled on machines without CUDA (IntelGPU/AMDGPU-only
+    hosts), reusing the cutile availability gate (which also honors
+    ``TILEGYM_DISABLE_CUTILE``).
+
+    Requires the cuTile package, a CUDA device, and the translation toolchain
+    binaries on PATH.
     """
-    if not CUTILE_AVAILABLE:
+    if not is_cutile_available():
         return False
     return all(shutil.which(tool) is not None for tool in _DROPTOKENS_TOOLS)
 
@@ -261,6 +267,17 @@ def _load_from_environment():
     backend = os.environ.get("CUTILE_TUTORIALS_BACKEND", _CURRENT_BACKENDS)
     if backend in _AVAILABLE_BACKENDS:
         _CURRENT_BACKENDS = backend
+    elif backend == _CURRENT_BACKENDS and _AVAILABLE_BACKENDS:
+        # The default backend is unavailable on this machine (e.g. no CUDA
+        # driver); fall back to an available backend instead of failing the
+        # import. An explicit CUTILE_TUTORIALS_BACKEND request below still
+        # raises so misconfiguration is visible.
+        fallback = sorted(_AVAILABLE_BACKENDS)[0]
+        logger.warning(
+            f"Default backend '{backend}' is not available on this machine; "
+            f"falling back to '{fallback}'"
+        )
+        _CURRENT_BACKENDS = fallback
     else:
         raise ValueError(f"Unknown backend: {backend}, available backends: {_AVAILABLE_BACKENDS}")
 

@@ -25,7 +25,10 @@ from .translator import prepare_triton_kernel
 
 @lru_cache(maxsize=None)
 def _prepare_swiglu_forward(n_rows, n_cols, dtype, device):
-    a = torch.empty((n_rows, n_cols), dtype=dtype, device=device)
+    # CPU dummies: only tensor metadata (dtype/shape/strides) is read for the
+    # kernel signature, so no GPU device is needed to prepare the kernel.
+    # This keeps the translation pipeline runnable on driverless machines.
+    a = torch.empty((n_rows, n_cols), dtype=dtype, device="cpu")
     b = torch.empty_like(a)
     c = torch.empty_like(a)
 
