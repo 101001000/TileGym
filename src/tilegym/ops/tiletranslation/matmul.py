@@ -213,10 +213,9 @@ def _tiletranslation_autotune_matmul(stream, a, b, c):
             lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
         )
         best_cfg = result.best.config
-        _matmul_tune_cache[cache_key] = (best_cfg, result.kernel)
+        _matmul_tune_cache[cache_key] = result.best.config
 
-    best_cfg, compiled = _matmul_tune_cache[cache_key]
-
+    best_cfg = _matmul_tune_cache[cache_key]
 
     kernel_args = (
         a, b, c,
@@ -232,7 +231,12 @@ def _tiletranslation_autotune_matmul(stream, a, b, c):
         1,
     )
 
-    invoke_triton_kernel(compiled, grid, *_launch_args(_matmul_kernel, kernel_args))
+    invoke_triton_kernel(
+        _matmul_kernel,
+        grid,
+        *kernel_args,
+        options={"num_ctas": best_cfg.num_ctas},
+    )
 
     #ct.launch(
     #    stream,
@@ -243,7 +247,7 @@ def _tiletranslation_autotune_matmul(stream, a, b, c):
     return c
 
 
-def _tiletranslation_autotune_static_persistent_matmul(a, b, c, M, N, K, trans_a, trans_b):
+def _tiletranslation_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a, trans_b):
     NUM_SMS = get_sms()
     cache_key = (M, N, K, trans_a, trans_b, a.dtype, str(a.device))
     if cache_key not in _static_persistent_matmul_tune_cache:
@@ -278,9 +282,9 @@ def _tiletranslation_autotune_static_persistent_matmul(a, b, c, M, N, K, trans_a
             lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
         )
         best_cfg = result.best.config
-        _static_persistent_matmul_tune_cache[cache_key] = (best_cfg, result.kernel)
+        _static_persistent_matmul_tune_cache[cache_key] = result.best.config
 
-    best_cfg, compiled = _static_persistent_matmul_tune_cache[cache_key]
+    best_cfg = _static_persistent_matmul_tune_cache[cache_key]
     #ct.launch(
     #    stream,
     #    (
@@ -327,7 +331,12 @@ def _tiletranslation_autotune_static_persistent_matmul(a, b, c, M, N, K, trans_a
         1,
     )
 
-    invoke_triton_kernel(compiled, grid, *_launch_args(_static_persistent_matmul_kernel, kernel_args))
+    invoke_triton_kernel(
+        _static_persistent_matmul_kernel,
+        grid,
+        *kernel_args,
+        options={"num_ctas": best_cfg.num_ctas},
+    )
 
     return c
 

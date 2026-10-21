@@ -237,8 +237,30 @@ def prepare_triton_kernel(kernel, kernel_args, options=None):
     return triton.compile(ttir_path, options=options or {})
 
 
-def invoke_triton_kernel(kernel, grid, *kernel_args):
-    kernel[grid](*kernel_args)
+_compiled_kernel_cache = {}
+
+
+def invoke_triton_kernel(kernel, grid, *kernel_args, options=None):
+    device = next(
+        (str(arg.device) for arg in kernel_args if isinstance(arg, torch.Tensor)),
+        None,
+    )
+
+    key = (
+        kernel,
+        device,
+        get_sm_arch(),
+        _kernel_cache_key(kernel_args, options),
+    )
+
+    compiled = _compiled_kernel_cache.get(key)
+
+    if compiled is None:
+        compiled = prepare_triton_kernel(kernel, kernel_args, options)
+        _compiled_kernel_cache[key] = compiled
+
+    compiled[grid](*_launch_args(kernel, kernel_args))
+    return compiled
 
 
 def get_sms():
@@ -281,20 +303,20 @@ def exhaustive_search_triton(
         kernel_args = args_fn(cfg)
         hints = hints_fn(cfg)
 
-        compiled = prepare_triton_kernel(
-            kernel,
-            kernel_args,
-            options={"num_ctas": hints["num_ctas"]},
-        )
-
         grid = grid_fn(cfg)
-        launch_args = _launch_args(kernel, kernel_args)
+        options = {"num_ctas": hints["num_ctas"]}
 
         device_module = getattr(torch, kernel_args[0].device.type)
 
         with device_module.stream(stream):
+            compiled = invoke_triton_kernel(
+                kernel, grid, *kernel_args, options=options
+            )
+
             time_ms = triton.testing.do_bench(
-                lambda: invoke_triton_kernel(compiled, grid, *launch_args)
+                lambda: invoke_triton_kernel(
+                    kernel, grid, *kernel_args, options=options
+                )
             )
 
         if time_ms < best_time:

@@ -9,8 +9,6 @@ pipeline. The kernel itself lives only in the cuTile backend
 (:mod:`tilegym.ops.cutile.swiglu`) and is imported from there.
 """
 
-from functools import lru_cache
-
 import torch
 
 from tilegym.backend import register_impl
@@ -19,22 +17,8 @@ from tilegym.ops.cutile.swiglu import _swiglu_forward_kernel
 from tilegym.ops.cutile.utils import next_power_of_2
 
 from .translator import invoke_triton_kernel
-from .translator import prepare_triton_kernel
 
 
-@lru_cache(maxsize=None)
-def _prepare_swiglu_forward(n_rows, n_cols, dtype):
-    a = torch.empty((n_rows, n_cols), dtype=dtype, device="meta")
-    b = torch.empty_like(a)
-    c = torch.empty_like(a)
-
-    tile_size = next_power_of_2(n_cols)
-    check_bounds = tile_size != n_cols
-
-    return prepare_triton_kernel(
-        _swiglu_forward_kernel,
-        (a, b, c, tile_size, check_bounds),
-    )
 
 def _swiglu_forward(a, b):
     """
@@ -48,14 +32,16 @@ def _swiglu_forward(a, b):
     c = torch.empty_like(a)
     n_rows = a.shape[0]
 
-    kernel = _prepare_swiglu_forward(n_rows, n_cols, a.dtype)
+    TILE_SIZE = next_power_of_2(n_cols)
+    # Drop bounds checking only when the power-of-2 tile exactly covers n_cols
+    # (every lane in-bounds); irregular shapes keep masking on the partial tile.
+    check_bounds = TILE_SIZE != n_cols
+    grid = (n_rows,)
 
     invoke_triton_kernel(
-        kernel,
+        _swiglu_forward_kernel,
         (n_rows, 1, 1),
-        a, *a.shape, *a.stride(),
-        b, *b.shape, *b.stride(),
-        c, *c.shape, *c.stride(),
+        a, b, c, TILE_SIZE, check_bounds,
     )
 
     return c.view(*ori_shape)
