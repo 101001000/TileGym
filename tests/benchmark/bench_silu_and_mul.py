@@ -16,6 +16,7 @@ from tilegym.backend import register_impl
 ALL_BACKENDS = [
     ("cutile", "CuTile", ("orange", "-")) if is_backend_available("cutile") else None,
     ("tilecpp", "TileCpp", ("purple", "-")) if is_backend_available("tilecpp") else None,
+    ("tiletranslation", "TileTranslation", ("orange", "-")) if is_backend_available("tiletranslation") else None,
     ("torch", "PyTorch", ("green", "-")),
 ]
 
@@ -101,7 +102,7 @@ def bench_silu_and_mul(
     total_bytes = input_bytes + output_bytes
 
     # Use triton's cudagraph benchmark for timing
-    ms = triton.testing.do_bench_cudagraph(fn)
+    ms = triton.testing.do_bench(fn)
 
     # Calculate GB/s
     gb_per_s = total_bytes * 1e-9 / (ms * 1e-3)

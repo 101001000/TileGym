@@ -16,8 +16,7 @@ from tilegym.backend import register_impl
 from tilegym.logger import get_logger
 
 from .translator import get_capability, exhaustive_search_triton, get_sms
-from .translator import prepare_triton_kernel, invoke_triton_kernel, _launch_args
-from functools import lru_cache
+from .translator import invoke_triton_kernel
 
 # Module-level tune caches: (M, N, K, dtype, device) -> (best_cfg, tuned_kernel)
 _matmul_tune_cache: dict = {}

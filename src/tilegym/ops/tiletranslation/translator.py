@@ -197,7 +197,7 @@ def _kernel_source_hash(kernel) -> str:
     return hashlib.sha1(source.encode()).hexdigest()[:8]
 
 
-def _kernel_cache_key(kernel_args, options):
+def _kernel_cache_key(kernel_args, hints):
     parts = []
 
     for arg in kernel_args:
@@ -209,14 +209,14 @@ def _kernel_cache_key(kernel_args, options):
         else:
             parts.append(str(arg))
 
-    for name, value in sorted((options or {}).items()):
+    for name, value in sorted((hints or {}).items()):
         parts.append(f"{name}_{value}")
 
     return ".".join(parts)
 
 
-def prepare_triton_kernel(kernel, kernel_args, options=None):
-    key = _kernel_cache_key(kernel_args, options)
+def prepare_triton_kernel(kernel, kernel_args, hints=None):
+    key = _kernel_cache_key(kernel_args, hints)
 
     src_hash = _kernel_source_hash(kernel)
     kernel_name = kernel._annotated_function.pyfunc.__name__
@@ -230,17 +230,18 @@ def prepare_triton_kernel(kernel, kernel_args, options=None):
     ttir_path = f"{base}.ttir"
 
     if not Path(ttir_path).exists():
-        emit_bytecode(kernel, kernel_args, bytecode_path)
+        tuned_kernel = kernel.replace_hints(**hints) if hints else kernel
+        emit_bytecode(tuned_kernel, kernel_args, bytecode_path)
         emit_mlir(bytecode_path, mlir_path)
         translate_tileir(mlir_path, ttir_path)
 
-    return triton.compile(ttir_path, options=options or {})
-
+    options = {"num_ctas": hints["num_ctas"]} if hints and hints.get("num_ctas") is not None else {}
+    return triton.compile(ttir_path, options=options)
 
 _compiled_kernel_cache = {}
 
 
-def invoke_triton_kernel(kernel, grid, *kernel_args, options=None):
+def invoke_triton_kernel(kernel, grid, *kernel_args, hints=None):
     device = next(
         (str(arg.device) for arg in kernel_args if isinstance(arg, torch.Tensor)),
         None,
@@ -250,14 +251,16 @@ def invoke_triton_kernel(kernel, grid, *kernel_args, options=None):
         kernel,
         device,
         get_sm_arch(),
-        _kernel_cache_key(kernel_args, options),
+        _kernel_cache_key(kernel_args, hints),
     )
 
     compiled = _compiled_kernel_cache.get(key)
 
     if compiled is None:
-        compiled = prepare_triton_kernel(kernel, kernel_args, options)
+        compiled = prepare_triton_kernel(kernel, kernel_args, hints)
         _compiled_kernel_cache[key] = compiled
+
+    grid = tuple(grid) + (1,) * (3 - len(grid))
 
     compiled[grid](*_launch_args(kernel, kernel_args))
     return compiled
@@ -304,18 +307,17 @@ def exhaustive_search_triton(
         hints = hints_fn(cfg)
 
         grid = grid_fn(cfg)
-        options = {"num_ctas": hints["num_ctas"]}
 
         device_module = getattr(torch, kernel_args[0].device.type)
 
         with device_module.stream(stream):
             compiled = invoke_triton_kernel(
-                kernel, grid, *kernel_args, options=options
+                kernel, grid, *kernel_args, hints=hints
             )
 
             time_ms = triton.testing.do_bench(
                 lambda: invoke_triton_kernel(
-                    kernel, grid, *kernel_args, options=options
+                    kernel, grid, *kernel_args, hints=hints
                 )
             )
 

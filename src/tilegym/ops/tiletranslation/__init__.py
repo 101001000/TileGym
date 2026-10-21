@@ -10,6 +10,7 @@ from tilegym.backend import is_backend_available
 if is_backend_available("tiletranslation"):
     from . import swiglu
     from . import matmul
+    from . import silu_and_mul
 
     # Import specific functions for direct access
     from .swiglu import get_swiglu
@@ -18,6 +19,7 @@ if is_backend_available("tiletranslation"):
         "swiglu",
         "get_swiglu",
         "matmul",
+        "silu_and_mul",
     ]
 else:
     __all__ = []
