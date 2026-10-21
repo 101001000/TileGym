@@ -47,6 +47,8 @@ class Test_RoPE(common.PyTestCase):
     _backends = ["cutile", "triton"]
     if is_backend_available("tilecpp"):
         _backends = _backends + ["tilecpp"]
+    if is_backend_available("droptokens"):
+        _backends = _backends + ["droptokens"]
     _perf_backends = _backends + ["pytorch"]
 
     @pytest.mark.parametrize(

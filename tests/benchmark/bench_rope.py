@@ -73,9 +73,11 @@ def create_rotary_embeddings(seq_len, head_dim, dtype, device, base=10000.0):
 
 # Available backends with their display names and plot styles
 ALL_BACKENDS = [
-    ("triton", "Triton", ("red", "-")),
+    ("triton", "Triton", ("red", "-")) if is_backend_available("triton") else None,
     ("cutile", "CuTile", ("blue", "-")) if is_backend_available("cutile") else None,
+    ("droptokens", "DropTokens", ("red", "-")) if is_backend_available("droptokens") else None,
     ("tilecpp", "TileCpp", ("purple", "-")) if is_backend_available("tilecpp") else None,
+    ("tiletranslation", "TileTranslation", ("orange", "-")) if is_backend_available("tiletranslation") else None,
     ("torch", "PyTorch", ("green", "-")),
 ]
 
@@ -167,7 +169,7 @@ def bench_rope(
     torch.testing.assert_close(fn(), ref(), atol=1e-2, rtol=1e-2)
 
     # Benchmark the function
-    ms = triton.testing.do_bench_cudagraph(fn)
+    ms = triton.testing.do_bench(fn)
 
     # Calculate memory bandwidth
     # Total memory: read q, k, cos, sin + write q_out, k_out

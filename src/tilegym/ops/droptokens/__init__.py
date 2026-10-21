@@ -8,13 +8,18 @@ from tilegym.backend import is_backend_available
 
 # Only import if droptokens backend is available
 if is_backend_available("droptokens"):
+    from . import rope
     from . import swiglu
 
     # Import specific functions for direct access
+    from .rope import apply_rope_base, get_apply_rope_func
     from .swiglu import get_swiglu
 
     __all__ = [
+        "rope",
         "swiglu",
+        "apply_rope_base",
+        "get_apply_rope_func",
         "get_swiglu",
     ]
 else:
