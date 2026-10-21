@@ -51,11 +51,12 @@ def create_benchmark_config(datatype):
 
     backends, names, styles = zip(*available_backends)
     dtype_name = str(datatype).split(".")[-1]  # e.g., 'float16' from 'torch.float16'
-    compute_capability = torch.cuda.get_device_capability()
-    if compute_capability[0] == 10:
-        max_range = 16
-    else:
-        max_range = 15  # To avoid OOM
+    #compute_capability = torch.cuda.get_device_capability()
+    #if compute_capability[0] == 10:
+    #    max_range = 16
+    #else:
+    #    max_range = 15  # To avoid OOM
+    max_range = 15
     return triton.testing.Benchmark(
         x_names=["M", "N", "K"],
         x_vals=[2**i for i in range(10, max_range)],
@@ -71,8 +72,9 @@ def create_benchmark_config(datatype):
 
 
 # FP8 requires SM90+ (Hopper/Blackwell); skip on SM80 (A100)
-_gpu_cap = torch.cuda.get_device_capability()
-_dtypes = [torch.float16] if _gpu_cap[0] < 9 else [torch.float16, torch.float8_e5m2]
+#_gpu_cap = torch.cuda.get_device_capability()
+#_dtypes = [torch.float16] if _gpu_cap[0] < 9 else [torch.float16, torch.float8_e5m2]
+_dtypes = [torch.float16] 
 
 
 @triton.testing.perf_report([create_benchmark_config(datatype) for datatype in _dtypes])
@@ -93,7 +95,7 @@ def benchmark(M, N, K, backend, datatype):
         ref = lambda: reference_matmul(a, b)
         torch.testing.assert_close(fn(), ref())
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 

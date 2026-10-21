@@ -306,3 +306,11 @@ def exhaustive_search_triton(
         best=SimpleNamespace(config=best_cfg, mean_us=best_time * 1000),
         kernel=best_kernel,
     )
+
+
+def _allocate_scratch(size, alignment, stream):
+    device = triton.runtime.driver.active.get_active_torch_device()
+    return torch.empty(size, dtype=torch.uint8, device=device)
+
+
+triton.set_allocator(_allocate_scratch)

@@ -16,6 +16,8 @@ from tilegym.backend import register_impl
 from tilegym.logger import get_logger
 
 from .translator import get_capability, exhaustive_search_triton, get_sms
+from .translator import prepare_triton_kernel, invoke_triton_kernel, _launch_args
+from functools import lru_cache
 
 # Module-level tune caches: (M, N, K, dtype, device) -> (best_cfg, tuned_kernel)
 _matmul_tune_cache: dict = {}
@@ -211,11 +213,27 @@ def _tiletranslation_autotune_matmul(stream, a, b, c):
             lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
         )
         best_cfg = result.best.config
-        _matmul_tune_cache[cache_key] = (
-            best_cfg,
-            _matmul_kernel.replace_hints(num_ctas=best_cfg.num_ctas, occupancy=best_cfg.occupancy),
-        )
-    best_cfg, tuned_kernel = _matmul_tune_cache[cache_key]
+        _matmul_tune_cache[cache_key] = (best_cfg, result.kernel)
+
+    best_cfg, compiled = _matmul_tune_cache[cache_key]
+
+
+    kernel_args = (
+        a, b, c,
+        best_cfg.TILE_SIZE_M,
+        best_cfg.TILE_SIZE_N,
+        best_cfg.TILE_SIZE_K,
+    )
+
+
+    grid = (
+        ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N),
+        1,
+        1,
+    )
+
+    invoke_triton_kernel(compiled, grid, *_launch_args(_matmul_kernel, kernel_args))
+
     #ct.launch(
     #    stream,
     #    (ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N), 1, 1),
@@ -260,11 +278,9 @@ def _tiletranslation_autotune_static_persistent_matmul(a, b, c, M, N, K, trans_a
             lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
         )
         best_cfg = result.best.config
-        _static_persistent_matmul_tune_cache[cache_key] = (
-            best_cfg,
-            _static_persistent_matmul_kernel.replace_hints(num_ctas=best_cfg.num_ctas, occupancy=best_cfg.occupancy),
-        )
-    best_cfg, tuned_kernel = _static_persistent_matmul_tune_cache[cache_key]
+        _static_persistent_matmul_tune_cache[cache_key] = (best_cfg, result.kernel)
+
+    best_cfg, compiled = _static_persistent_matmul_tune_cache[cache_key]
     #ct.launch(
     #    stream,
     #    (
@@ -290,6 +306,29 @@ def _tiletranslation_autotune_static_persistent_matmul(a, b, c, M, N, K, trans_a
     #        best_cfg.LOAD_LATENCY,
     #    ),
     #)
+
+    kernel_args = (
+        a, b, c, M, N, K,
+        best_cfg.TILE_SIZE_M,
+        best_cfg.TILE_SIZE_N,
+        best_cfg.TILE_SIZE_K,
+        trans_a,
+        trans_b,
+        best_cfg.GROUP_SIZE_M,
+        best_cfg.LOAD_LATENCY,
+    )
+
+    grid = (
+        min(
+            NUM_SMS // best_cfg.num_ctas,
+            ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N),
+        ) * best_cfg.occupancy,
+        1,
+        1,
+    )
+
+    invoke_triton_kernel(compiled, grid, *_launch_args(_static_persistent_matmul_kernel, kernel_args))
+
     return c
 
 
