@@ -31,6 +31,7 @@ register_impl("matmul", "torch")(reference_matmul)
 ALL_BACKENDS = [
     ("cutile", "CuTile", ("orange", "-")) if is_backend_available("cutile") else None,
     ("tilecpp", "TileCpp", ("purple", "-")) if is_backend_available("tilecpp") else None,
+    ("tiletranslation", "TileTranslation", ("orange", "-")) if is_backend_available("tiletranslation") else None,
     ("torch", "PyTorch", ("green", "-")),
 ]
 

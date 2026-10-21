@@ -47,6 +47,10 @@ def get_sm_arch() -> str:
     """
     return os.environ.get("TILEGYM_SM_ARCH", DEFAULT_SM_ARCH)
 
+def get_capability() -> tuple[int, int]:
+    sm_arch = get_sm_arch()
+    capability = int(sm_arch.removeprefix("sm_"))
+    return capability // 10, capability % 10
 
 def _array_constraint_from_tensor(t: torch.Tensor) -> ArrayConstraint:
     """Build an ArrayConstraint from tensor metadata alone (no CUDA driver).
@@ -146,7 +150,7 @@ def validate_mlir(mlir_path):
         check=True,
     )
 
-def emit_bytecode(kernel, kernel_args, output_path, gpu_code):
+def emit_bytecode(kernel, kernel_args, output_path):
     signature = signature_from_args(
         kernel,
         kernel_args,
@@ -156,7 +160,7 @@ def emit_bytecode(kernel, kernel_args, output_path, gpu_code):
         kernel,
         [signature],
         output_path,
-        gpu_code=gpu_code,
+        gpu_code=get_sm_arch(),
         output_format="tileir_bytecode",
     )
 
@@ -193,30 +197,112 @@ def _kernel_source_hash(kernel) -> str:
     return hashlib.sha1(source.encode()).hexdigest()[:8]
 
 
-def prepare_triton_kernel(kernel, kernel_args, gpu_code, op, key):
-    """Translate a cuTile kernel to Triton, caching artifacts on disk.
+def _kernel_cache_key(kernel_args, options):
+    parts = []
 
-    The ``.tilebc`` / ``.tileir.mlir`` / ``.ttir`` artifacts are stored under
-    ``<TILEGYM cache root>/tiletranslation/<op>/`` named
-    ``<key>.<gpu_code>.<src_hash>`` so different ops, targets and kernel
-    versions never collide. When the ``.ttir`` is already cached (it is
-    written last, so its presence means the pipeline completed), the
-    subprocess pipeline is skipped entirely.
-    """
+    for arg in kernel_args:
+        if isinstance(arg, torch.Tensor):
+            shape = "x".join(map(str, arg.shape))
+            stride = "x".join(map(str, arg.stride()))
+            dtype = str(arg.dtype).removeprefix("torch.")
+            parts.append(f"{dtype}_{shape}_s{stride}")
+        else:
+            parts.append(str(arg))
+
+    for name, value in sorted((options or {}).items()):
+        parts.append(f"{name}_{value}")
+
+    return ".".join(parts)
+
+
+def prepare_triton_kernel(kernel, kernel_args, options=None):
+    key = _kernel_cache_key(kernel_args, options)
+
     src_hash = _kernel_source_hash(kernel)
-    cache_dir = get_cache_dir("tiletranslation", op)
+    kernel_name = kernel._annotated_function.pyfunc.__name__
+    gpu_code = get_sm_arch()
+
+    cache_dir = get_cache_dir("tiletranslation", kernel_name)
     base = cache_dir / f"{key}.{gpu_code}.{src_hash}"
+
     bytecode_path = f"{base}.tilebc"
     mlir_path = f"{base}.tileir.mlir"
     ttir_path = f"{base}.ttir"
 
     if not Path(ttir_path).exists():
-        emit_bytecode(kernel, kernel_args, bytecode_path, gpu_code)
+        emit_bytecode(kernel, kernel_args, bytecode_path)
         emit_mlir(bytecode_path, mlir_path)
         translate_tileir(mlir_path, ttir_path)
 
-    return triton.compile(ttir_path)
+    return triton.compile(ttir_path, options=options or {})
 
 
 def invoke_triton_kernel(kernel, grid, *kernel_args):
     kernel[grid](*kernel_args)
+
+
+def get_sms():
+    if torch.backends.mps.is_available():
+        return torch.backends.mps.get_core_count()
+    elif torch.xpu.is_available():
+        return torch.xpu.get_device_properties(0).max_compute_units
+    elif torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).multi_processor_count
+    else:
+        raise RuntimeError("No supported GPU backend available for get_sms")
+
+        import triton.testing
+from types import SimpleNamespace
+
+
+def _launch_args(kernel, kernel_args):
+    args = []
+
+    for ann, arg in zip(kernel._annotated_function.parameter_annotations, kernel_args):
+        if ann.constant:
+            continue
+
+        if isinstance(arg, torch.Tensor):
+            args.extend((arg, *arg.shape, *arg.stride()))
+        else:
+            args.append(arg)
+
+    return tuple(args)
+
+
+def exhaustive_search_triton(
+    configs, stream, grid_fn, kernel, args_fn, hints_fn,
+):
+    best_time = float("inf")
+    best_cfg = None
+    best_kernel = None
+
+    for cfg in configs:
+        kernel_args = args_fn(cfg)
+        hints = hints_fn(cfg)
+
+        compiled = prepare_triton_kernel(
+            kernel,
+            kernel_args,
+            options={"num_ctas": hints["num_ctas"]},
+        )
+
+        grid = grid_fn(cfg)
+        launch_args = _launch_args(kernel, kernel_args)
+
+        device_module = getattr(torch, kernel_args[0].device.type)
+
+        with device_module.stream(stream):
+            time_ms = triton.testing.do_bench(
+                lambda: invoke_triton_kernel(compiled, grid, *launch_args)
+            )
+
+        if time_ms < best_time:
+            best_time = time_ms
+            best_cfg = cfg
+            best_kernel = compiled
+
+    return SimpleNamespace(
+        best=SimpleNamespace(config=best_cfg, mean_us=best_time * 1000),
+        kernel=best_kernel,
+    )

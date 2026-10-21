@@ -18,31 +18,23 @@ from tilegym.backend import register_impl
 from tilegym.ops.cutile.swiglu import _swiglu_forward_kernel
 from tilegym.ops.cutile.utils import next_power_of_2
 
-from .translator import get_sm_arch
 from .translator import invoke_triton_kernel
 from .translator import prepare_triton_kernel
 
 
 @lru_cache(maxsize=None)
-def _prepare_swiglu_forward(n_rows, n_cols, dtype, device):
-    # CPU dummies: only tensor metadata (dtype/shape/strides) is read for the
-    # kernel signature, so no GPU device is needed to prepare the kernel.
-    # This keeps the translation pipeline runnable on driverless machines.
-    a = torch.empty((n_rows, n_cols), dtype=dtype, device="cpu")
+def _prepare_swiglu_forward(n_rows, n_cols, dtype):
+    a = torch.empty((n_rows, n_cols), dtype=dtype, device="meta")
     b = torch.empty_like(a)
     c = torch.empty_like(a)
 
-    TILE_SIZE = next_power_of_2(n_cols)
-    check_bounds = TILE_SIZE != n_cols
+    tile_size = next_power_of_2(n_cols)
+    check_bounds = tile_size != n_cols
 
     return prepare_triton_kernel(
         _swiglu_forward_kernel,
-        (a, b, c, TILE_SIZE, check_bounds),
-        get_sm_arch(),
-        "swiglu",
-        f"{device.index}_{n_rows}_{n_cols}_{dtype}",
+        (a, b, c, tile_size, check_bounds),
     )
-
 
 def _swiglu_forward(a, b):
     """
@@ -56,7 +48,7 @@ def _swiglu_forward(a, b):
     c = torch.empty_like(a)
     n_rows = a.shape[0]
 
-    kernel = _prepare_swiglu_forward(n_rows, n_cols, a.dtype, a.device)
+    kernel = _prepare_swiglu_forward(n_rows, n_cols, a.dtype)
 
     invoke_triton_kernel(
         kernel,
