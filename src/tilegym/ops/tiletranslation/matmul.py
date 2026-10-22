@@ -234,7 +234,10 @@ def _tiletranslation_autotune_matmul(stream, a, b, c):
         _matmul_kernel,
         grid,
         *kernel_args,
-        options={"num_ctas": best_cfg.num_ctas},
+        hints={
+            "num_ctas": best_cfg.num_ctas,
+            "occupancy": best_cfg.occupancy,
+        },
     )
 
     #ct.launch(
@@ -334,7 +337,10 @@ def _tiletranslation_autotune_static_persistent_matmul(stream, a, b, c, M, N, K,
         _static_persistent_matmul_kernel,
         grid,
         *kernel_args,
-        options={"num_ctas": best_cfg.num_ctas},
+        hints={
+            "num_ctas": best_cfg.num_ctas,
+            "occupancy": best_cfg.occupancy,
+        },
     )
 
     return c

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import torch
 import triton
+import triton.testing
+from types import SimpleNamespace
 
 import cuda.tile as ct
 from cuda.tile.compilation import CallingConvention, KernelSignature, export_kernel
@@ -178,12 +180,29 @@ def emit_mlir(bytecode_path, output_path):
     )
     validate_mlir(output_path)
 
-def translate_tileir(mlir_path, output_path):
+def translate_tileir(mlir_path, output_path, cfg=None):
+
+    # Load/store translation modes:
+    # - Default: TMA everywhere (plain-loads=false, auto-plain-loads=false).
+    # - plain-loads=true: plain masked loads/stores everywhere.
+    # - auto-plain-loads=true: plain outside loops, TMA inside loops (recommended).
+    # - Both enabled: plain-loads takes precedence, forcing plain loads/stores everywhere.
+
+    pass_name = "convert-cuda-tile-to-triton"
+
+    if cfg is not None:
+        settings = {
+            "true": "plain-loads=true",
+            "false": "plain-loads=false",
+            "auto": "auto-plain-loads=true",
+        }
+        pass_name += f"{{{settings[cfg.plain_loads]}}}"
+
     subprocess.run(
         [
             "triton-cuda-tile-opt",
             str(mlir_path),
-            "--pass-pipeline=builtin.module(convert-cuda-tile-to-triton,reconcile-unrealized-casts)",
+            f"--pass-pipeline=builtin.module({pass_name},reconcile-unrealized-casts)",
             "-o",
             str(output_path),
         ],
@@ -197,7 +216,7 @@ def _kernel_source_hash(kernel) -> str:
     return hashlib.sha1(source.encode()).hexdigest()[:8]
 
 
-def _kernel_cache_key(kernel_args, hints):
+def _kernel_cache_key(kernel_args, hints, cfg=None):
     parts = []
 
     for arg in kernel_args:
@@ -212,11 +231,13 @@ def _kernel_cache_key(kernel_args, hints):
     for name, value in sorted((hints or {}).items()):
         parts.append(f"{name}_{value}")
 
+    parts.append(f"plain_loads_{cfg.plain_loads if cfg is not None else 'default'}")
+
     return ".".join(parts)
 
 
-def prepare_triton_kernel(kernel, kernel_args, hints=None):
-    key = _kernel_cache_key(kernel_args, hints)
+def prepare_triton_kernel(kernel, kernel_args, hints=None, cfg=None):
+    key = _kernel_cache_key(kernel_args, hints, cfg)
 
     src_hash = _kernel_source_hash(kernel)
     kernel_name = kernel._annotated_function.pyfunc.__name__
@@ -233,7 +254,7 @@ def prepare_triton_kernel(kernel, kernel_args, hints=None):
         tuned_kernel = kernel.replace_hints(**hints) if hints else kernel
         emit_bytecode(tuned_kernel, kernel_args, bytecode_path)
         emit_mlir(bytecode_path, mlir_path)
-        translate_tileir(mlir_path, ttir_path)
+        translate_tileir(mlir_path, ttir_path, cfg)
 
     options = {"num_ctas": hints["num_ctas"]} if hints and hints.get("num_ctas") is not None else {}
     return triton.compile(ttir_path, options=options)
@@ -241,7 +262,7 @@ def prepare_triton_kernel(kernel, kernel_args, hints=None):
 _compiled_kernel_cache = {}
 
 
-def invoke_triton_kernel(kernel, grid, *kernel_args, hints=None):
+def invoke_triton_kernel(kernel, grid, *kernel_args, hints=None, cfg=None):
     device = next(
         (str(arg.device) for arg in kernel_args if isinstance(arg, torch.Tensor)),
         None,
@@ -251,13 +272,13 @@ def invoke_triton_kernel(kernel, grid, *kernel_args, hints=None):
         kernel,
         device,
         get_sm_arch(),
-        _kernel_cache_key(kernel_args, hints),
+        _kernel_cache_key(kernel_args, hints, cfg),
     )
 
     compiled = _compiled_kernel_cache.get(key)
 
     if compiled is None:
-        compiled = prepare_triton_kernel(kernel, kernel_args, hints)
+        compiled = prepare_triton_kernel(kernel, kernel_args, hints, cfg)
         _compiled_kernel_cache[key] = compiled
 
     grid = tuple(grid) + (1,) * (3 - len(grid))
@@ -276,9 +297,6 @@ def get_sms():
     else:
         raise RuntimeError("No supported GPU backend available for get_sms")
 
-        import triton.testing
-from types import SimpleNamespace
-
 
 def _launch_args(kernel, kernel_args):
     args = []
@@ -296,7 +314,7 @@ def _launch_args(kernel, kernel_args):
 
 
 def exhaustive_search_triton(
-    configs, stream, grid_fn, kernel, args_fn, hints_fn,
+    configs, stream, grid_fn, kernel, args_fn, hints_fn, translation_cfg=None
 ):
     best_time = float("inf")
     best_cfg = None
@@ -312,12 +330,12 @@ def exhaustive_search_triton(
 
         with device_module.stream(stream):
             compiled = invoke_triton_kernel(
-                kernel, grid, *kernel_args, hints=hints
+                kernel, grid, *kernel_args, hints=hints, cfg=translation_cfg
             )
 
             time_ms = triton.testing.do_bench(
                 lambda: invoke_triton_kernel(
-                    kernel, grid, *kernel_args, hints=hints
+                    kernel, grid, *kernel_args, hints=hints, cfg=translation_cfg
                 )
             )
 

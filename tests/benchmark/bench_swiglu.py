@@ -71,7 +71,7 @@ def create_benchmark_config(batch_size, M, dtype):
     [
         create_benchmark_config(batch_size, M, dtype)
         for batch_size in [1, 4, 8]  # Different batch sizes
-        for M in [128, 4096]  # Different rows
+        for M in [128, 2048]  # Different rows
         for dtype in [torch.float16, torch.bfloat16, torch.float32]
     ]
 )
