@@ -48,10 +48,13 @@ register_impl("rms_norm", "torch")(reference_rms_norm)
 # makes this benchmark run for tens of minutes. tilecpp remains covered by the
 # ops tests.
 ALL_CONFIGS = [
-    ("triton", None, "Triton", ("orange", "-")),
-    ("cutile", "static_persistent", "CuTile static persistent", ("purple", "-")),
-    ("cutile", "multi_wave_reload", "CuTile multi wave reload", ("blue", "-")),
-    ("cutile", "multi_wave_cached", "CuTile multi wave cached", ("red", "--")),
+    ("triton", None, "Triton", ("orange", "-")) if is_backend_available("triton") else None,
+    ("cutile", "static_persistent", "CuTile static persistent", ("purple", "-")) if is_backend_available("cutile") else None,
+    ("cutile", "multi_wave_reload", "CuTile multi wave reload", ("blue", "-")) if is_backend_available("cutile") else None,
+    ("cutile", "multi_wave_cached", "CuTile multi wave cached", ("red", "--")) if is_backend_available("cutile") else None,
+    ("tiletranslation", "static_persistent", "TileTranslation static persistent", ("pink", "-")) if is_backend_available("tiletranslation") else None,
+    ("tiletranslation", "multi_wave_reload", "TileTranslation multi wave reload", ("yellow", "-")) if is_backend_available("tiletranslation") else None,
+    ("tiletranslation", "multi_wave_cached", "TileTranslation multi wave cached", ("white", "-")) if is_backend_available("tiletranslation") else None,
     ("torch", None, "PyTorch", ("green", "-")),
 ]
 
@@ -109,6 +112,7 @@ def bench_rmsnorm(N, config_idx, dtype, M, device=DEVICE):
 
     fn = lambda: tilegym.ops.rms_norm(x, w_shape, weight, eps, mode=mode, backend=backend)
     ref = lambda: reference_rms_norm(x, w_shape, weight, eps)
+    print(f"N={N}, dtype={dtype}, backend={backend}, mode={mode}", flush=True)
     torch.testing.assert_close(fn(), ref(), atol=5e-2, rtol=0.0)
 
     # Benchmark the function

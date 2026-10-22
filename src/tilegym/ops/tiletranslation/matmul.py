@@ -15,8 +15,7 @@ from tilegym.autotune import is_autotune_disabled
 from tilegym.backend import register_impl
 from tilegym.logger import get_logger
 
-from .translator import get_capability, exhaustive_search_triton, get_sms
-from .translator import invoke_triton_kernel
+from .translator import get_capability, exhaustive_search_triton, get_sms, invoke_triton_kernel
 
 # Module-level tune caches: (M, N, K, dtype, device) -> (best_cfg, tuned_kernel)
 _matmul_tune_cache: dict = {}
@@ -231,8 +230,9 @@ def _tiletranslation_autotune_matmul(stream, a, b, c):
     )
 
     invoke_triton_kernel(
-        _matmul_kernel,
+        stream,
         grid,
+        _matmul_kernel,
         *kernel_args,
         hints={
             "num_ctas": best_cfg.num_ctas,
@@ -334,8 +334,9 @@ def _tiletranslation_autotune_static_persistent_matmul(stream, a, b, c, M, N, K,
     )
 
     invoke_triton_kernel(
-        _static_persistent_matmul_kernel,
+        stream,
         grid,
+        _static_persistent_matmul_kernel,
         *kernel_args,
         hints={
             "num_ctas": best_cfg.num_ctas,

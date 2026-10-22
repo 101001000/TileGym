@@ -81,8 +81,9 @@ def _launch_silu_kernel(kernel, args, grid, cache_key, configs, launch_hints):
             _SILU_TUNE_CACHE[cache_key] = best_hints
 
     invoke_triton_kernel(
-        kernel,
+        stream,
         grid,
+        kernel,
         *args,
         hints=best_hints,
     )

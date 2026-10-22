@@ -62,9 +62,12 @@ def _rope_forward(q, k, cos, sin, rope_dim=None):
     grid = (n_row, 1, 1)
     best_hints = _select_rope_kernel(q, k, cos, sin, rope_dim, grid, TILE_QH, TILE_KH, TILE_RD)
 
+
+
     invoke_triton_kernel(
-        _rope_kernel,
+        torch.accelerator.current_stream(q.device),
         grid,
+        _rope_kernel,
         q, k, cos, sin,
         cos.shape[0],
         seq_len,

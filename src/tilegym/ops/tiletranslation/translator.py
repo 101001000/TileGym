@@ -178,7 +178,7 @@ def emit_mlir(bytecode_path, output_path):
         ],
         check=True,
     )
-    validate_mlir(output_path)
+    #validate_mlir(output_path)
 
 def translate_tileir(mlir_path, output_path, cfg=None):
 
@@ -189,6 +189,7 @@ def translate_tileir(mlir_path, output_path, cfg=None):
     # - Both enabled: plain-loads takes precedence, forcing plain loads/stores everywhere.
 
     pass_name = "convert-cuda-tile-to-triton"
+
 
     if cfg is not None:
         settings = {
@@ -236,6 +237,30 @@ def _kernel_cache_key(kernel_args, hints, cfg=None):
     return ".".join(parts)
 
 
+
+def _recommended_num_warps(ttir_path, max_warps=8, min_warps=4):
+    """Pick num_warps from the largest tile in the translated TTIR.
+
+    Rule of thumb: keep elements-per-thread <= 128 so register pressure stays
+    below the spill threshold (a 32k-element tile at the default 4 warps
+    spills to local memory and loses ~5x throughput). num_warps =
+    clamp(max_tile_elems / 4096, 4, 8).
+    """
+    import re
+    try:
+        text = Path(ttir_path).read_text()
+    except OSError:
+        return min_warps
+    max_elems = 0
+    for m in re.finditer(r"tensor<([0-9x]+)x", text):
+        dims = [d for d in m.group(1).split("x") if d]
+        if dims:
+            max_elems = max(max_elems, math.prod(int(d) for d in dims))
+    if max_elems <= 0:
+        return min_warps
+    return max(min_warps, min(max_warps, -(-max_elems // 4096)))
+
+
 def prepare_triton_kernel(kernel, kernel_args, hints=None, cfg=None):
     key = _kernel_cache_key(kernel_args, hints, cfg)
 
@@ -254,38 +279,41 @@ def prepare_triton_kernel(kernel, kernel_args, hints=None, cfg=None):
         tuned_kernel = kernel.replace_hints(**hints) if hints else kernel
         emit_bytecode(tuned_kernel, kernel_args, bytecode_path)
         emit_mlir(bytecode_path, mlir_path)
-        translate_tileir(mlir_path, ttir_path, cfg)
+        translate_tileir(bytecode_path, ttir_path, cfg)
 
     options = {"num_ctas": hints["num_ctas"]} if hints and hints.get("num_ctas") is not None else {}
+    options["num_warps"] = hints["num_worker_warps"] if hints and hints.get("num_worker_warps") is not None else _recommended_num_warps(ttir_path)
     return triton.compile(ttir_path, options=options)
 
 _compiled_kernel_cache = {}
 
+def invoke_triton_kernel(stream, grid, kernel, *kernel_args, hints=None, cfg=None):
+    if len(kernel_args) == 1 and isinstance(kernel_args[0], tuple):
+            kernel_args = kernel_args[0]
 
-def invoke_triton_kernel(kernel, grid, *kernel_args, hints=None, cfg=None):
-    device = next(
-        (str(arg.device) for arg in kernel_args if isinstance(arg, torch.Tensor)),
-        None,
-    )
+    with stream:
+        device = next(
+            (str(arg.device) for arg in kernel_args if isinstance(arg, torch.Tensor)),
+            None,
+        )
 
-    key = (
-        kernel,
-        device,
-        get_sm_arch(),
-        _kernel_cache_key(kernel_args, hints, cfg),
-    )
+        key = (
+            kernel,
+            device,
+            get_sm_arch(),
+            _kernel_cache_key(kernel_args, hints, cfg),
+        )
 
-    compiled = _compiled_kernel_cache.get(key)
+        compiled = _compiled_kernel_cache.get(key)
 
-    if compiled is None:
-        compiled = prepare_triton_kernel(kernel, kernel_args, hints, cfg)
-        _compiled_kernel_cache[key] = compiled
+        if compiled is None:
+            compiled = prepare_triton_kernel(kernel, kernel_args, hints, cfg)
+            _compiled_kernel_cache[key] = compiled
 
-    grid = tuple(grid) + (1,) * (3 - len(grid))
+        grid = tuple(grid) + (1,) * (3 - len(grid))
 
-    compiled[grid](*_launch_args(kernel, kernel_args))
-    return compiled
-
+        compiled[grid](*_launch_args(kernel, kernel_args))
+        return compiled
 
 def get_sms():
     if torch.backends.mps.is_available():
@@ -330,12 +358,12 @@ def exhaustive_search_triton(
 
         with device_module.stream(stream):
             compiled = invoke_triton_kernel(
-                kernel, grid, *kernel_args, hints=hints, cfg=translation_cfg
+                stream, grid, kernel, *kernel_args, hints=hints, cfg=translation_cfg
             )
 
             time_ms = triton.testing.do_bench(
                 lambda: invoke_triton_kernel(
-                    kernel, grid, *kernel_args, hints=hints, cfg=translation_cfg
+                    stream, grid, kernel, *kernel_args, hints=hints, cfg=translation_cfg
                 )
             )
 

@@ -12,11 +12,14 @@ if is_backend_available("tiletranslation"):
     from . import matmul
     from . import silu_and_mul
     from . import rope
+    from . import rms_norm
 
     # Import specific functions for direct access
     from .swiglu import get_swiglu
     from .rope import apply_rope_base
     from .rope import get_apply_rope_func
+    from .rms_norm import get_rms_norm_module
+    from .rms_norm import rms_norm
 
     __all__ = [
         "swiglu",
@@ -25,6 +28,8 @@ if is_backend_available("tiletranslation"):
         "silu_and_mul",
         "apply_rope_base",
         "get_apply_rope_func",
+        "rms_norm",
+        "get_rms_norm_module",
     ]
 else:
     __all__ = []

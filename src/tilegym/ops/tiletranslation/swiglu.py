@@ -39,8 +39,9 @@ def _swiglu_forward(a, b):
     grid = (n_rows,)
 
     invoke_triton_kernel(
-        _swiglu_forward_kernel,
+        torch.accelerator.current_stream(a.device),
         (n_rows, 1, 1),
+        _swiglu_forward_kernel,
         a, b, c, TILE_SIZE, check_bounds,
     )
 
