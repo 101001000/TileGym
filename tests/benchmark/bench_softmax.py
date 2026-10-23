@@ -30,6 +30,7 @@ register_impl("softmax", "torch")(reference_softmax)
 ALL_BACKENDS = [
     ("cutile", "CuTile", ("blue", "-")) if is_backend_available("cutile") else None,
     ("tilecpp", "TileCpp", ("purple", "-")) if is_backend_available("tilecpp") else None,
+    ("tiletranslation", "TileTranslation", ("orange", "-")) if is_backend_available("tiletranslation") else None,
     ("torch", "PyTorch", ("green", "-")),
 ]
 

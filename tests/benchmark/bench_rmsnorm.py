@@ -2,6 +2,13 @@
 #
 # SPDX-License-Identifier: MIT
 
+# Must be set before torch/kineto initialization to take effect.
+# Silences libkineto's CUPTI buffer warnings that flood the CUDA-graph
+# profiling output for this benchmark.
+import os
+
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")
+
 from typing import Any
 from typing import Optional
 

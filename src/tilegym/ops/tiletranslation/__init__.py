@@ -13,6 +13,7 @@ if is_backend_available("tiletranslation"):
     from . import silu_and_mul
     from . import rope
     from . import rms_norm
+    from . import softmax
 
     # Import specific functions for direct access
     from .swiglu import get_swiglu
@@ -20,6 +21,7 @@ if is_backend_available("tiletranslation"):
     from .rope import get_apply_rope_func
     from .rms_norm import get_rms_norm_module
     from .rms_norm import rms_norm
+    from .softmax import softmax
 
     __all__ = [
         "swiglu",
@@ -30,6 +32,7 @@ if is_backend_available("tiletranslation"):
         "get_apply_rope_func",
         "rms_norm",
         "get_rms_norm_module",
+        "softmax",
     ]
 else:
     __all__ = []
