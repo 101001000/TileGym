@@ -24,6 +24,8 @@ class Test_FlashDecode(common.PyTestCase):
     _backends = ["cutile"]
     if is_backend_available("tilecpp"):
         _backends = _backends + ["tilecpp"]
+    if is_backend_available("tiletranslation"):
+        _backends = _backends + ["tiletranslation"]
     _perf_frameworks = _backends + ["pytorch"]
 
     @pytest.mark.parametrize("seq_len", [9, 119, 256, 8192])

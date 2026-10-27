@@ -15,8 +15,17 @@ from tilegym.transformers import apply_tilegym_kernel_to_qwen2
 from tilegym.transformers import apply_tilegym_kernel_to_qwen3
 
 
-def apply_tilegym_patch(model_id, use_attn=False, use_cutile=False):
+def apply_tilegym_patch(model_id, use_attn=False, use_cutile=False, use_tiletranslation=False):
     model_name = model_id.lower()
+    if use_tiletranslation:
+        # Route rope/rms_norm/swiglu (and other dispatched ops) through the
+        # tiletranslation backend. The per-model patchers below must then be
+        # called with use_cutile=False so their set_backend("cutile") does not
+        # override this.
+        from tilegym import set_backend
+
+        set_backend("tiletranslation")
+    use_cutile = use_cutile and not use_tiletranslation
     if "llama" in model_name:
         apply_tilegym_kernel_to_llama(rope=True, swiglu=True, rms_norm=True, attn=use_attn, use_cutile=use_cutile)
     elif "deepseek" in model_name:

@@ -1,3 +1,4 @@
+from . import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
@@ -7,15 +8,11 @@ from types import SimpleNamespace
 
 import cuda.tile as ct
 import torch
-
-from tilegym.ops.cutile.matmul import _matmul_kernel
-from tilegym.ops.cutile.matmul import _static_persistent_matmul_kernel
+from .translator import exhaustive_search
 
 from tilegym.autotune import is_autotune_disabled
 from tilegym.backend import register_impl
 from tilegym.logger import get_logger
-
-from .translator import get_capability, exhaustive_search_triton, get_sms, invoke_triton_kernel
 
 # Module-level tune caches: (M, N, K, dtype, device) -> (best_cfg, tuned_kernel)
 _matmul_tune_cache: dict = {}
@@ -43,6 +40,29 @@ _FP64_PERSISTENT_MATMUL_CONFIGS = {
     (12, 0): ((64, 64, 64),),
     (12, 1): ((64, 64, 64),),
 }
+
+
+def _swizzle_2d(M, N, TILE_SIZE_M, TILE_SIZE_N, GROUP_SIZE_M):
+    # Get the global IDs of the current CUDA block (CTA) in a 1D grid.
+    bid = ct.bid(0)
+    num_bid_m = ct.cdiv(M, TILE_SIZE_M)
+    num_bid_n = ct.cdiv(N, TILE_SIZE_N)
+    num_bid_in_group = GROUP_SIZE_M * num_bid_n
+    group_id = bid // num_bid_in_group
+    first_bid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_bid_m - first_bid_m, GROUP_SIZE_M)
+    bid_m = first_bid_m + (bid % group_size_m)
+    bid_n = (bid % num_bid_in_group) // group_size_m
+    return bid_m, bid_n
+
+
+def _compute_bid(tile_id, num_bid_in_group, num_bid_m, GROUP_SIZE_M):
+    group_id = tile_id // num_bid_in_group
+    first_bid_m = group_id * GROUP_SIZE_M
+    group_size_m = ct.minimum(num_bid_m - first_bid_m, GROUP_SIZE_M)
+    bid_m = first_bid_m + (tile_id % group_size_m)
+    bid_n = (tile_id % num_bid_in_group) // group_size_m
+    return bid_m, bid_n
 
 
 def _matmul_autotune_configs(dtype):
@@ -87,7 +107,7 @@ def _static_persistent_matmul_autotune_configs(dtype):
     """
     Iterator of autotune configurations for static persistent matmul kernel.
     """
-    gpu_capability = get_capability()
+    gpu_capability = torch.cuda.get_device_capability()
 
     # LOAD_LATENCY = ct.load cost hint (1..10, -1 = compiler-inferred). Only sm90 tunes it
     # today; all other arches pass -1 (compiler-inferred = original behavior), but every
@@ -193,7 +213,193 @@ def _static_persistent_matmul_autotune_configs(dtype):
             TILE_SIZE_M=128, TILE_SIZE_N=128, TILE_SIZE_K=64, GROUP_SIZE_M=8, num_ctas=1, occupancy=1, LOAD_LATENCY=-1
         )
 
-def _tiletranslation_autotune_matmul(stream, a, b, c):
+
+@ct.kernel
+def _matmul_kernel(
+    A,
+    B,
+    C,
+    TILE_SIZE_M: ConstInt,  # Tile size along M dimension (rows of C)
+    TILE_SIZE_N: ConstInt,  # Tile size along N dimension (columns of C)
+    TILE_SIZE_K: ConstInt,
+):  # Tile size along K dimension (inner product dimension)
+    """
+    cuTile kernel for performing matrix multiplication C = A @ B.
+
+    This kernel uses a tiled approach, where each CUDA thread block (CTA)
+    computes a `TILE_SIZE_M` x `TILE_SIZE_N` tile of the output matrix C. The computation
+    involves iterating over the K-dimension in chunks of `TILE_SIZE_K`.
+
+    Args:
+        A: Input matrix A (M x K).
+        B: Input matrix B (K x N).
+        C: Output matrix C (M x N).
+        TILE_SIZE_M (ConstInt): The height of the output tile computed by this block.
+                       Corresponds to rows of A and C.
+        TILE_SIZE_N (ConstInt): The width of the output tile computed by this block.
+                       Corresponds to columns of B and C.
+        TILE_SIZE_K (ConstInt): The depth of the inner loop (K-dimension) tile size.
+                       Corresponds to columns of A and rows of B.
+    """
+    GROUP_SIZE_M = 8
+    M = A.shape[0]
+    N = B.shape[1]
+    bidx, bidy = _swizzle_2d(M, N, TILE_SIZE_M, TILE_SIZE_N, GROUP_SIZE_M)
+
+    # Calculate the total number of K-tiles that need to be processed.
+    # `ct.num_tiles(A, axis=1, shape=(TILE_SIZE_M, TILE_SIZE_K))` extracts the K-dimension (axis 1)
+    # from matrix A's shape, assuming A's shape is conceptually (M_tiles, K_tiles),
+    # and then implicitly performs ceiling division by `TILE_SIZE_K` to get the number of K-tiles.
+    num_tiles_k = ct.num_tiles(A, axis=1, shape=(TILE_SIZE_M, TILE_SIZE_K))
+
+    # Initialize an accumulator for the current output tile (TILE_SIZE_M x TILE_SIZE_N).
+    # It's common practice to use `float32` for accumulation even with `float16` inputs
+    # to maintain higher precision during the sum-reduction of the matrix multiplication.
+    accumulator_dtype = ct.float64 if A.dtype == ct.float64 else ct.float32
+    accumulator = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0, dtype=accumulator_dtype)
+    zero_pad = ct.PaddingMode.ZERO
+
+    # Convert fp32 to tf32 to use tensorcore
+    dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
+
+    # K-dimension loop: Iterate over the K-dimension in chunks of 'TILE_SIZE_K'.
+    # In each iteration, a `TILE_SIZE_M` x `TILE_SIZE_K` tile from A and a `TILE_SIZE_K` x `TILE_SIZE_N` tile from B
+    # are loaded, multiplied, and accumulated.
+    for k in range(num_tiles_k):
+        # Load tile from matrix A.
+        # The `index=(bidx, k_tile_idx)` specifies which (M-tile, K-tile) to load
+        # from global memory A. `shape=(TILE_SIZE_M, TILE_SIZE_K)` defines the size of this tile.
+        a = ct.load(A, index=(bidx, k), shape=(TILE_SIZE_M, TILE_SIZE_K), padding_mode=zero_pad).astype(dtype)
+
+        # Load tile from matrix B.
+        # The `index=(k_tile_idx, bidy)` specifies which (K-tile, N-tile) to load
+        # from global memory B. `shape=(TILE_SIZE_K, TILE_SIZE_N)` defines the size of this tile.
+        b = ct.load(B, index=(k, bidy), shape=(TILE_SIZE_K, TILE_SIZE_N), padding_mode=zero_pad).astype(dtype)
+
+        # Perform Matrix Multiplication for the current tiles.
+        # `ct.mma` computes the product of the two loaded tiles and accumulates the result.
+        accumulator = ct.mma(a, b, accumulator)
+
+    # Convert the final accumulated result to the desired output data type (C.dtype).
+    # This might downcast from float32 to float16 if the output is float16.
+    accumulator = ct.astype(accumulator, C.dtype)
+
+    # Store the computed tile to the global memory of the output matrix C.
+    # The `(bidx, bidy)` directly corresponds to the tile's position in the 2D output matrix.
+    ct.store(C, index=(bidx, bidy), tile=accumulator)
+
+
+@ct.kernel
+def _static_persistent_matmul_kernel(
+    A,
+    B,
+    C,
+    M: int,
+    N: int,
+    K: int,
+    TILE_SIZE_M: ct.Constant[int],
+    TILE_SIZE_N: ct.Constant[int],
+    TILE_SIZE_K: ct.Constant[int],
+    TRANSPOSE_A: ct.Constant[bool],
+    TRANSPOSE_B: ct.Constant[bool],
+    GROUP_SIZE_M: ct.Constant[int],
+    LOAD_LATENCY: ct.Constant[int],
+):
+    """CuTile static persistent matmul kernel: C = A @ B with static scheduling"""
+    start_bid = ct.bid(0)
+
+    # Calculate total number of tiles
+    num_bid_m = ct.cdiv(M, TILE_SIZE_M)
+    num_bid_n = ct.cdiv(N, TILE_SIZE_N)
+    k_tiles = ct.cdiv(K, TILE_SIZE_K)
+    num_tiles = num_bid_m * num_bid_n
+    zero_pad = ct.PaddingMode.ZERO
+    num_programs = ct.num_blocks(0)
+
+    # Static persistent scheduling loop
+    for tile_id in range(start_bid, num_tiles, num_programs):
+        # Calculate tile coordinates using GROUP_SIZE_M grouping
+        num_bid_in_group = GROUP_SIZE_M * num_bid_n
+        bid_m, bid_n = _compute_bid(tile_id, num_bid_in_group, num_bid_m, GROUP_SIZE_M)
+
+        # Initialize accumulator
+        accumulator_dtype = ct.float64 if A.dtype == ct.float64 else ct.float32
+        accumulator = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=accumulator_dtype)
+
+        # K-dimension loop. LOAD_LATENCY (constexpr) in 1..10 sets the ct.load cost
+        # hint on BOTH operand loads; <=0 means "compiler-inferred" (omit the kwarg,
+        # since ct.load rejects -1). Explicit constexpr if/else (same pattern as
+        # TRANSPOSE_*) — the cuTile tracer does NOT support **kwargs unpacking.
+        for k_tile in range(k_tiles):
+            # Load A tile (tuned: A's load cost is also on the critical path — tuning
+            # both A and B reaches 6.74 ms vs 7.27 ms for B-only, ~7-8% better)
+            if TRANSPOSE_A:
+                # A is transposed: load from (K, M) layout
+                if LOAD_LATENCY >= 1:
+                    a = ct.load(
+                        A,
+                        index=(k_tile, bid_m),
+                        shape=(TILE_SIZE_K, TILE_SIZE_M),
+                        padding_mode=zero_pad,
+                        latency=LOAD_LATENCY,
+                    )
+                else:
+                    a = ct.load(A, index=(k_tile, bid_m), shape=(TILE_SIZE_K, TILE_SIZE_M), padding_mode=zero_pad)
+                a = ct.transpose(a)  # Convert to (TILE_SIZE_M, TILE_SIZE_K)
+            else:
+                # A is normal: load from (M, K) layout
+                if LOAD_LATENCY >= 1:
+                    a = ct.load(
+                        A,
+                        index=(bid_m, k_tile),
+                        shape=(TILE_SIZE_M, TILE_SIZE_K),
+                        padding_mode=zero_pad,
+                        latency=LOAD_LATENCY,
+                    )
+                else:
+                    a = ct.load(A, index=(bid_m, k_tile), shape=(TILE_SIZE_M, TILE_SIZE_K), padding_mode=zero_pad)
+
+            # Load B tile
+            if TRANSPOSE_B:
+                # B is transposed: load from (N, K) layout
+                if LOAD_LATENCY >= 1:
+                    b = ct.load(
+                        B,
+                        index=(bid_n, k_tile),
+                        shape=(TILE_SIZE_N, TILE_SIZE_K),
+                        padding_mode=zero_pad,
+                        latency=LOAD_LATENCY,
+                    )
+                else:
+                    b = ct.load(B, index=(bid_n, k_tile), shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=zero_pad)
+                b = ct.transpose(b)  # Convert to (TILE_SIZE_K, TILE_SIZE_N)
+            else:
+                # B is normal: load from (K, N) layout
+                if LOAD_LATENCY >= 1:
+                    b = ct.load(
+                        B,
+                        index=(k_tile, bid_n),
+                        shape=(TILE_SIZE_K, TILE_SIZE_N),
+                        padding_mode=zero_pad,
+                        latency=LOAD_LATENCY,
+                    )
+                else:
+                    b = ct.load(B, index=(k_tile, bid_n), shape=(TILE_SIZE_K, TILE_SIZE_N), padding_mode=zero_pad)
+
+            # Convert fp32 to tf32 to use tensorcore
+            dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
+            a = ct.astype(a, dtype)
+            b = ct.astype(b, dtype)
+
+            # Matrix multiplication and accumulation
+            accumulator = ct.mma(a, b, acc=accumulator)
+
+        # Convert to output dtype and store
+        result = ct.astype(accumulator, C.dtype)
+        ct.store(C, index=(bid_m, bid_n), tile=result)
+
+
+def _cutile_autotune_matmul(stream, a, b, c):
     M, N = c.shape
     K = a.shape[1]
     cache_key = (M, N, K, a.dtype, str(a.device))
@@ -201,149 +407,95 @@ def _tiletranslation_autotune_matmul(stream, a, b, c):
         configs = list(_matmul_autotune_configs(a.dtype))
         if is_autotune_disabled():
             configs = configs[:1]
-        #with ct.compiler_timeout(5):
-        result = exhaustive_search_triton(
-            configs,
-            stream,
-            lambda cfg: (ceil(M / cfg.TILE_SIZE_M) * ceil(N / cfg.TILE_SIZE_N), 1, 1),
-            _matmul_kernel,
-            lambda cfg: (a, b, c, cfg.TILE_SIZE_M, cfg.TILE_SIZE_N, cfg.TILE_SIZE_K),
-            lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
-        )
+        with ts.dummy():
+            result = exhaustive_search(
+                configs,
+                stream,
+                lambda cfg: (ceil(M / cfg.TILE_SIZE_M) * ceil(N / cfg.TILE_SIZE_N), 1, 1),
+                _matmul_kernel,
+                lambda cfg: (a, b, c, cfg.TILE_SIZE_M, cfg.TILE_SIZE_N, cfg.TILE_SIZE_K),
+                lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+            )
         best_cfg = result.best.config
-        _matmul_tune_cache[cache_key] = result.best.config
-
-    best_cfg = _matmul_tune_cache[cache_key]
-
-    kernel_args = (
-        a, b, c,
-        best_cfg.TILE_SIZE_M,
-        best_cfg.TILE_SIZE_N,
-        best_cfg.TILE_SIZE_K,
-    )
-
-
-    grid = (
-        ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N),
-        1,
-        1,
-    )
-
-    invoke_triton_kernel(
+        _matmul_tune_cache[cache_key] = (
+            best_cfg,
+            _matmul_kernel.replace_hints(num_ctas=best_cfg.num_ctas, occupancy=best_cfg.occupancy),
+        )
+    best_cfg, tuned_kernel = _matmul_tune_cache[cache_key]
+    ts.launch(
         stream,
-        grid,
-        _matmul_kernel,
-        *kernel_args,
-        hints={
-            "num_ctas": best_cfg.num_ctas,
-            "occupancy": best_cfg.occupancy,
-        },
+        (ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N), 1, 1),
+        tuned_kernel,
+        (a, b, c, best_cfg.TILE_SIZE_M, best_cfg.TILE_SIZE_N, best_cfg.TILE_SIZE_K),
     )
-
-    #ct.launch(
-    #    stream,
-    #    (ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N), 1, 1),
-    #    tuned_kernel,
-    #    (a, b, c, best_cfg.TILE_SIZE_M, best_cfg.TILE_SIZE_N, best_cfg.TILE_SIZE_K),
-    #)
     return c
 
 
-def _tiletranslation_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a, trans_b):
-    NUM_SMS = get_sms()
+def _cutile_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a, trans_b):
+    NUM_SMS = ts.multi_processor_count()
     cache_key = (M, N, K, trans_a, trans_b, a.dtype, str(a.device))
     if cache_key not in _static_persistent_matmul_tune_cache:
         configs = list(_static_persistent_matmul_autotune_configs(a.dtype))
         if is_autotune_disabled():
             configs = configs[:1]
-        #with ct.compiler_timeout(5):
-        result = exhaustive_search_triton(
-            configs,
-            stream,
-            lambda cfg: (
-                min(NUM_SMS // cfg.num_ctas, ceil(M / cfg.TILE_SIZE_M) * ceil(N / cfg.TILE_SIZE_N)) * cfg.occupancy,
-                1,
-                1,
-            ),
-            _static_persistent_matmul_kernel,
-            lambda cfg: (
-                a,
-                b,
-                c,
-                M,
-                N,
-                K,
-                cfg.TILE_SIZE_M,
-                cfg.TILE_SIZE_N,
-                cfg.TILE_SIZE_K,
-                trans_a,
-                trans_b,
-                cfg.GROUP_SIZE_M,
-                cfg.LOAD_LATENCY,
-            ),
-            lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
-        )
+        with ts.dummy():
+            result = exhaustive_search(
+                configs,
+                stream,
+                lambda cfg: (
+                    min(NUM_SMS // cfg.num_ctas, ceil(M / cfg.TILE_SIZE_M) * ceil(N / cfg.TILE_SIZE_N)) * cfg.occupancy,
+                    1,
+                    1,
+                ),
+                _static_persistent_matmul_kernel,
+                lambda cfg: (
+                    a,
+                    b,
+                    c,
+                    M,
+                    N,
+                    K,
+                    cfg.TILE_SIZE_M,
+                    cfg.TILE_SIZE_N,
+                    cfg.TILE_SIZE_K,
+                    trans_a,
+                    trans_b,
+                    cfg.GROUP_SIZE_M,
+                    cfg.LOAD_LATENCY,
+                ),
+                lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+            )
         best_cfg = result.best.config
-        _static_persistent_matmul_tune_cache[cache_key] = result.best.config
-
-    best_cfg = _static_persistent_matmul_tune_cache[cache_key]
-    #ct.launch(
-    #    stream,
-    #    (
-    #        min(NUM_SMS // best_cfg.num_ctas, ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N))
-    #        * best_cfg.occupancy,
-    #        1,
-    #        1,
-    #    ),
-    #    tuned_kernel,
-    #    (
-    #        a,
-    #        b,
-    #        c,
-    #        M,
-    #        N,
-    #        K,
-    #        best_cfg.TILE_SIZE_M,
-    #        best_cfg.TILE_SIZE_N,
-    #        best_cfg.TILE_SIZE_K,
-    #        trans_a,
-    #        trans_b,
-    #        best_cfg.GROUP_SIZE_M,
-    #        best_cfg.LOAD_LATENCY,
-    #    ),
-    #)
-
-    kernel_args = (
-        a, b, c, M, N, K,
-        best_cfg.TILE_SIZE_M,
-        best_cfg.TILE_SIZE_N,
-        best_cfg.TILE_SIZE_K,
-        trans_a,
-        trans_b,
-        best_cfg.GROUP_SIZE_M,
-        best_cfg.LOAD_LATENCY,
-    )
-
-    grid = (
-        min(
-            NUM_SMS // best_cfg.num_ctas,
-            ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N),
-        ) * best_cfg.occupancy,
-        1,
-        1,
-    )
-
-    invoke_triton_kernel(
+        _static_persistent_matmul_tune_cache[cache_key] = (
+            best_cfg,
+            _static_persistent_matmul_kernel.replace_hints(num_ctas=best_cfg.num_ctas, occupancy=best_cfg.occupancy),
+        )
+    best_cfg, tuned_kernel = _static_persistent_matmul_tune_cache[cache_key]
+    ts.launch(
         stream,
-        grid,
-        _static_persistent_matmul_kernel,
-        *kernel_args,
-        hints={
-            "num_ctas": best_cfg.num_ctas,
-            "occupancy": best_cfg.occupancy,
-        },
+        (
+            min(NUM_SMS // best_cfg.num_ctas, ceil(M / best_cfg.TILE_SIZE_M) * ceil(N / best_cfg.TILE_SIZE_N))
+            * best_cfg.occupancy,
+            1,
+            1,
+        ),
+        tuned_kernel,
+        (
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            best_cfg.TILE_SIZE_M,
+            best_cfg.TILE_SIZE_N,
+            best_cfg.TILE_SIZE_K,
+            trans_a,
+            trans_b,
+            best_cfg.GROUP_SIZE_M,
+            best_cfg.LOAD_LATENCY,
+        ),
     )
-
     return c
 
 
@@ -374,11 +526,11 @@ def matmul(
     # Create output tensor
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    stream = torch.accelerator.current_stream(a.device)
+    stream = torch.accelerator.current_stream()
     if static_persistent:
-        _tiletranslation_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a, trans_b)
+        _cutile_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a, trans_b)
     else:
-        assert trans_a == False, "trans_a is not supported for tiletranslation"
-        assert trans_b == False, "trans_b is not supported for tiletranslation"
-        _tiletranslation_autotune_matmul(stream, a, b, c)
+        assert trans_a == False, "trans_a is not supported for cutile"
+        assert trans_b == False, "trans_b is not supported for cutile"
+        _cutile_autotune_matmul(stream, a, b, c)
     return c

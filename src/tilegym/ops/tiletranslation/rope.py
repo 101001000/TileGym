@@ -1,3 +1,4 @@
+from . import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
@@ -6,21 +7,119 @@ from types import SimpleNamespace
 
 import cuda.tile as ct
 import torch
+from .translator import exhaustive_search
 
 from tilegym.autotune import is_autotune_disabled
 from tilegym.backend import register_impl
 
-from .translator import get_capability, exhaustive_search_triton, get_sms
-from .translator import invoke_triton_kernel
-
+from tilegym.ops.cutile.utils import cached_replace_hints
 from tilegym.ops.cutile.utils import next_power_of_2
-from tilegym.ops.cutile.rope import _rope_kernel
-
 
 ConstInt = ct.Constant[int]
 PAD_ZERO = ct.PaddingMode.ZERO
 _ROPE_OCCUPANCY_CONFIGS = tuple(SimpleNamespace(occupancy=occ) for occ in (1, 7, 9, 12))
 _ROPE_TUNE_CACHE = {}
+
+
+@ct.kernel
+def _rope_kernel(
+    q,
+    k,
+    cos,
+    sin,
+    COS_BS: ConstInt,
+    SEQ_LEN: ConstInt,
+    TILE_QH: ConstInt,
+    TILE_KH: ConstInt,
+    TILE_RD: ConstInt,
+):
+    """
+    Unified RoPE kernel operating in-place on 4-D Q/K tensors.
+
+    Works for both full RoPE (TILE_RD = head_dim // 2) and partial RoPE
+    (TILE_RD = rope_dim // 2 < head_dim // 2).  Tile-space index
+    ``dim_tile=0`` selects ``[0 : TILE_RD]`` and ``dim_tile=1`` selects
+    ``[TILE_RD : 2*TILE_RD]``, so only the first ``2*TILE_RD`` elements
+    of head_dim are rotated; the rest pass through unchanged.
+
+    q shape: (bsz, num_q_heads, seq_len, head_dim)  — in-place
+    k shape: (bsz, num_kv_heads, seq_len, head_dim)  — in-place
+    cos shape: (cos_bs, seq_len, rope_dim)            — 3-D
+    sin shape: (cos_bs, seq_len, rope_dim)            — 3-D
+    """
+    bid = ct.bid(0)
+    batch_idx = bid // SEQ_LEN
+    row_idx = bid % SEQ_LEN
+    cos_batch_idx = 0 if COS_BS == 1 else batch_idx
+
+    # ####################################################################
+    # Load cos and sin values — first half of rope_dim
+    # ####################################################################
+    cos_row = ct.load(cos, index=(cos_batch_idx, row_idx, 0), shape=(1, 1, TILE_RD), padding_mode=PAD_ZERO).reshape(
+        (1, TILE_RD)
+    )
+    sin_row = ct.load(sin, index=(cos_batch_idx, row_idx, 0), shape=(1, 1, TILE_RD), padding_mode=PAD_ZERO).reshape(
+        (1, TILE_RD)
+    )
+
+    # ####################################################################
+    # Process Q tensor — first half [0:rope_dim//2] and second half
+    # [rope_dim//2:rope_dim] via tile-space dim_tile indexing
+    # ####################################################################
+    q_tile_1 = ct.load(
+        q,
+        index=(batch_idx, 0, row_idx, 0),
+        shape=(1, TILE_QH, 1, TILE_RD),
+        padding_mode=PAD_ZERO,
+    ).reshape((TILE_QH, TILE_RD))
+    q_tile_2 = ct.load(
+        q,
+        index=(batch_idx, 0, row_idx, 1),
+        shape=(1, TILE_QH, 1, TILE_RD),
+        padding_mode=PAD_ZERO,
+    ).reshape((TILE_QH, TILE_RD))
+    # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
+    new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
+    new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
+    ct.store(
+        q,
+        index=(batch_idx, 0, row_idx, 0),
+        tile=new_q_tile_1.reshape((1, TILE_QH, 1, TILE_RD)).astype(q.dtype),
+    )
+    ct.store(
+        q,
+        index=(batch_idx, 0, row_idx, 1),
+        tile=new_q_tile_2.reshape((1, TILE_QH, 1, TILE_RD)).astype(q.dtype),
+    )
+
+    # ####################################################################
+    # Process K tensor — same pattern
+    # ####################################################################
+    k_tile_1 = ct.load(
+        k,
+        index=(batch_idx, 0, row_idx, 0),
+        shape=(1, TILE_KH, 1, TILE_RD),
+        padding_mode=PAD_ZERO,
+    ).reshape((TILE_KH, TILE_RD))
+    k_tile_2 = ct.load(
+        k,
+        index=(batch_idx, 0, row_idx, 1),
+        shape=(1, TILE_KH, 1, TILE_RD),
+        padding_mode=PAD_ZERO,
+    ).reshape((TILE_KH, TILE_RD))
+    # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
+    new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
+    new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
+    ct.store(
+        k,
+        index=(batch_idx, 0, row_idx, 0),
+        tile=new_k_tile_1.reshape((1, TILE_KH, 1, TILE_RD)).astype(k.dtype),
+    )
+    ct.store(
+        k,
+        index=(batch_idx, 0, row_idx, 1),
+        tile=new_k_tile_2.reshape((1, TILE_KH, 1, TILE_RD)).astype(k.dtype),
+    )
 
 
 def _rope_forward(q, k, cos, sin, rope_dim=None):
@@ -60,39 +159,23 @@ def _rope_forward(q, k, cos, sin, rope_dim=None):
 
     n_row = batch_size * seq_len
     grid = (n_row, 1, 1)
-    best_hints = _select_rope_kernel(q, k, cos, sin, rope_dim, grid, TILE_QH, TILE_KH, TILE_RD)
-
-
-
-    invoke_triton_kernel(
-        torch.accelerator.current_stream(q.device),
+    kernel = _select_rope_kernel(q, k, cos, sin, rope_dim, grid, TILE_QH, TILE_KH, TILE_RD)
+    ts.launch(
+        torch.accelerator.current_stream(),
         grid,
-        _rope_kernel,
-        q, k, cos, sin,
-        cos.shape[0],
-        seq_len,
-        TILE_QH,
-        TILE_KH,
-        TILE_RD,
-        hints=best_hints,
+        kernel,
+        (
+            q,
+            k,
+            cos,
+            sin,
+            cos.shape[0],
+            seq_len,
+            TILE_QH,
+            TILE_KH,
+            TILE_RD,
+        ),
     )
-
-    #ct.launch(
-    #    torch.cuda.current_stream(),
-    #    grid,
-    #    kernel,
-    #    (
-    #        q,
-    #        k,
-    #        cos,
-    #        sin,
-    #        cos.shape[0],
-    #        seq_len,
-    #        TILE_QH,
-    #        TILE_KH,
-    #        TILE_RD,
-    #    ),
-    #)
 
     return q, k, cos, sin
 
@@ -118,13 +201,17 @@ def _rope_tune_cache_key(q, k, cos, sin, rope_dim, grid, tile_qh, tile_kh, tile_
 
 def _select_rope_kernel(q, k, cos, sin, rope_dim, grid, tile_qh, tile_kh, tile_rd):
     if is_autotune_disabled():
-        return {"occupancy": 9}
+        # Performance-oriented fallback: occ=9 keeps the common large full-RoPE
+        # shape close to 13.3. The default path still autotunes per shape.
+        return cached_replace_hints(_rope_kernel, occupancy=9)
 
     cache_key = _rope_tune_cache_key(q, k, cos, sin, rope_dim, grid, tile_qh, tile_kh, tile_rd)
     cached = _ROPE_TUNE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    # RoPE mutates q/k in-place, so autotune trials must operate on throwaway
+    # clones. Only the selected kernel is launched on the caller's tensors.
     def args_fn(cfg):
         q_trial = q.clone()
         k_trial = k.clone()
@@ -140,18 +227,24 @@ def _select_rope_kernel(q, k, cos, sin, rope_dim, grid, tile_qh, tile_kh, tile_r
             tile_rd,
         )
 
-    result = exhaustive_search_triton(
+    def grid_fn(cfg):
+        return grid
+
+    def hints_fn(cfg):
+        return {"occupancy": cfg.occupancy}
+
+    result = exhaustive_search(
         list(_ROPE_OCCUPANCY_CONFIGS),
-        torch.accelerator.current_stream(q.device),
-        lambda cfg: grid,
+        torch.accelerator.current_stream(),
+        grid_fn,
         _rope_kernel,
         args_fn,
-        lambda cfg: {"occupancy": cfg.occupancy},
+        hints_fn,
     )
-
-    best_hints = {"occupancy": result.best.config.occupancy}
-    _ROPE_TUNE_CACHE[cache_key] = best_hints
-    return best_hints
+    best_cfg = result.best.config
+    tuned_kernel = cached_replace_hints(_rope_kernel, occupancy=best_cfg.occupancy)
+    _ROPE_TUNE_CACHE[cache_key] = tuned_kernel
+    return tuned_kernel
 
 
 class _TileRopeFunction(torch.autograd.Function):

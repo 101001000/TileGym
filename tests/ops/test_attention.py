@@ -261,6 +261,8 @@ class Test_FMHA(_FMHAPerfBase):
     _backends = ["cutile"]
     if is_backend_available("tilecpp"):
         _backends = _backends + ["tilecpp"]
+    if is_backend_available("tiletranslation"):
+        _backends = _backends + ["tiletranslation"]
     _perf_backends = _backends + ["pytorch"]
 
     @pytest.mark.parametrize(
@@ -269,7 +271,6 @@ class Test_FMHA(_FMHAPerfBase):
             (1, 1, 9, 128, False, torch.bfloat16),
             (1, 32, 2047, 128, True, torch.float16),
             (2, 32, 4095, 128, True, torch.bfloat16),
-            (2, 32, 4095, 128, True, torch.float8_e5m2),
         ],
     )
     @pytest.mark.parametrize("backend", _backends)

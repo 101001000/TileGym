@@ -9,6 +9,19 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import cuda.tile as ct
+from tilegym.backend import get_current_backend
+
+_original_launch = ct.launch
+
+def checked_launch(*args, **kwargs):
+    if get_current_backend() == "tiletranslation":
+        raise RuntimeError("cuTile kernel executed with tiletranslation backend")
+
+    return _original_launch(*args, **kwargs)
+
+ct.launch = checked_launch
+
 from tilegym_hf_bench.forward import NaiveForwardWrapper
 from tilegym_hf_bench.hf_shim import load_model_with_cache
 from tilegym_hf_bench.hf_shim import load_tokenizer_with_cache
@@ -34,6 +47,11 @@ def parse_args(argv=None):
     parser.add_argument("--summary_file", type=str, default=None, help="File to append summary lines")
     parser.add_argument("--use_attn", action="store_true", help="Use attention")
     parser.add_argument("--use_cutile", action="store_true", help="Use cutile")
+    parser.add_argument(
+        "--use_tiletranslation",
+        action="store_true",
+        help="Use the tiletranslation backend (cuTile -> Triton)",
+    )
     parser.add_argument("--profile", action="store_true", help="Profile the model")
     parser.add_argument(
         "--log_dir",
@@ -74,7 +92,9 @@ def get_messages_list(args):
 def _detect_backend(args):
     backend = "base"
     if args.use_tilegym:
-        if args.use_cutile:
+        if args.use_tiletranslation:
+            backend = "tiletranslation"
+        elif args.use_cutile:
             backend = "cutile"
     return backend
 
@@ -89,7 +109,9 @@ def _model_name_for_case(model_id):
 def _build_case_id(args, backend):
     case_id = _model_name_for_case(args.model_id)
     if args.use_tilegym:
-        if args.use_cutile:
+        if backend == "tiletranslation":
+            case_id += "_tiletranslation"
+        elif args.use_cutile:
             case_id += "_cutile"
         if args.use_attn:
             case_id += "_attn"
@@ -128,7 +150,12 @@ def main(argv=None):
         print("########################")
         print("#######Use TileGym#########")
         print("########################")
-        apply_tilegym_patch(args.model_id, args.use_attn, use_cutile=(backend == "cutile"))
+        apply_tilegym_patch(
+            args.model_id,
+            args.use_attn,
+            use_cutile=(backend == "cutile"),
+            use_tiletranslation=(backend == "tiletranslation"),
+        )
 
     model_kwargs = {
         "trust_remote_code": False,

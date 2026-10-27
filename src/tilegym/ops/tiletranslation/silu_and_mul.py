@@ -1,3 +1,4 @@
+from . import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
@@ -8,21 +9,109 @@ from types import SimpleNamespace
 import cuda.tile as ct
 import torch
 from cuda.tile import RoundingMode as RMd
+from .translator import exhaustive_search
 
 from tilegym.autotune import is_autotune_disabled
 from tilegym.backend import register_impl
 from tilegym.experimental import experimental_kernel
 
+from tilegym.ops.cutile.utils import cached_replace_hints
 from tilegym.ops.cutile.utils import next_power_of_2
-from tilegym.ops.cutile.silu_and_mul import _silu_and_mul_kernel_row_wise, _silu_and_mul_backward_kernel_row_wise
-
-from .translator import get_capability, exhaustive_search_triton, invoke_triton_kernel
 
 ConstInt = ct.Constant[int]
 _LOG2_E = 1.4426950408889634
 
 _SILU_OCCUPANCY_CONFIGS = tuple(SimpleNamespace(occupancy=occupancy) for occupancy in (None, 1, 2, 4, 8, 12, 16))
 _SILU_TUNE_CACHE: dict = {}
+
+
+# To be launched with grid = number of rows (batch_size)
+# each "block" computes an entire row of the ouptut
+@ct.kernel
+def _silu_and_mul_kernel_row_wise(
+    input,
+    output,
+    TILE_SIZE: ConstInt,
+    TOTAL_HIDDEN_SIZE: ConstInt,
+):
+    bid = ct.bid(0)  # this gives us our row
+    offsets = ct.arange(TILE_SIZE, dtype=torch.int32)
+
+    # For 2D input (batch_size, 2*hidden_size), we need 2D indices
+    # Row index is just bid (scalar), column indices are offsets-based
+    row_idx = bid
+    a_col_idx = offsets  # First half: [0, hidden_size)
+    b_col_idx = offsets + TOTAL_HIDDEN_SIZE  # Second half: [hidden_size, 2*hidden_size)
+    # Load tiles using gather with 2D indices
+    # gather broadcasts (scalar, tile) to (tile,)
+    a_tile = ct.gather(input, (row_idx, a_col_idx), check_bounds=True)
+    b_tile = ct.gather(input, (row_idx, b_col_idx), check_bounds=True)
+    a_tile = ct.astype(a_tile, torch.float32)
+    b_tile = ct.astype(b_tile, torch.float32)
+
+    # Implement sigmoid for SiLU
+    denom = 1 + ct.exp2(ct.mul(-a_tile, _LOG2_E, flush_to_zero=True), flush_to_zero=True)
+    sigmoid_a = ct.truediv(1.0, denom, flush_to_zero=True, rounding_mode=RMd.APPROX)
+
+    # Perform SiLU(a) * b
+    silu_a = a_tile * sigmoid_a
+    result = silu_a * b_tile
+    result = ct.astype(result, output.dtype)
+    # output is also 2D: (batch_size, hidden_size)
+    out_col_idx = offsets
+    ct.scatter(output, (row_idx, out_col_idx), result, check_bounds=True)
+
+
+# Backward kernel for silu_and_mul
+# Computes gradients using recomputation (no saved activations)
+# Forward: c = silu(a) * b = a * sigmoid(a) * b
+# da = dc * b * (sigmoid(a) + a * sigmoid(a) * (1 - sigmoid(a)))
+#    = dc * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
+# db = dc * silu(a)
+@experimental_kernel
+@ct.kernel
+def _silu_and_mul_backward_kernel_row_wise(
+    grad_output,  # dc: (batch_size, hidden_size)
+    input,  # original input: (batch_size, 2*hidden_size)
+    grad_a,  # output: (batch_size, hidden_size)
+    grad_b,  # output: (batch_size, hidden_size)
+    TILE_SIZE: ConstInt,
+    TOTAL_HIDDEN_SIZE: ConstInt,
+):
+    bid = ct.bid(0)  # row index
+    offsets = ct.arange(TILE_SIZE, dtype=torch.int32)
+
+    row_idx = bid
+    a_col_idx = offsets  # First half: [0, hidden_size)
+    b_col_idx = offsets + TOTAL_HIDDEN_SIZE  # Second half: [hidden_size, 2*hidden_size)
+
+    # Load grad_output (dc)
+    dc_tile = ct.gather(grad_output, (row_idx, offsets), check_bounds=True)
+    dc_tile = ct.astype(dc_tile, torch.float32)
+
+    # Recompute a and b from input (saves memory vs saving in forward)
+    a_tile = ct.gather(input, (row_idx, a_col_idx), check_bounds=True)
+    b_tile = ct.gather(input, (row_idx, b_col_idx), check_bounds=True)
+    a_tile = ct.astype(a_tile, torch.float32)
+    b_tile = ct.astype(b_tile, torch.float32)
+
+    # Recompute sigmoid(a) and silu(a)
+    denom = 1 + ct.exp2(ct.mul(-a_tile, _LOG2_E, flush_to_zero=True), flush_to_zero=True)
+    sigmoid_a = ct.truediv(1.0, denom, flush_to_zero=True, rounding_mode=RMd.APPROX)
+    silu_a = a_tile * sigmoid_a
+
+    # Compute db = dc * silu(a)
+    db_tile = dc_tile * silu_a
+    db_tile = ct.astype(db_tile, input.dtype)
+    ct.scatter(grad_b, (row_idx, offsets), db_tile, check_bounds=True)
+
+    # Compute da = dc * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
+    # = dc * b * (sigmoid(a) + a * sigmoid(a) * (1 - sigmoid(a)))
+    one_minus_sigmoid = 1.0 + -sigmoid_a
+    silu_grad = sigmoid_a + silu_a * one_minus_sigmoid
+    da_tile = dc_tile * (b_tile * silu_grad)
+    da_tile = ct.astype(da_tile, input.dtype)
+    ct.scatter(grad_a, (row_idx, offsets), da_tile, check_bounds=True)
 
 
 def _ensure_contiguous(fn):
@@ -49,7 +138,7 @@ def _silu_autotune_hints(config, launch_hints):
 
 def _silu_autotune_settings(tile_size, dtype, device):
     tile_bytes = tile_size * dtype.itemsize
-    capability = get_capability()
+    capability = torch.cuda.get_device_capability(device)
     if tile_bytes <= 2048:
         hints = {"num_ctas": 1, "num_worker_warps": 4}
     elif tile_bytes <= 8192:
@@ -62,14 +151,13 @@ def _silu_autotune_settings(tile_size, dtype, device):
 
 
 def _launch_silu_kernel(kernel, args, grid, cache_key, configs, launch_hints):
-    stream = torch.accelerator.current_stream(args[0].device)
-
+    stream = torch.cuda.current_stream(args[0].device)
     if is_autotune_disabled():
-        best_hints = launch_hints
+        tuned_kernel = kernel
     else:
-        best_hints = _SILU_TUNE_CACHE.get(cache_key)
-        if best_hints is None:
-            result = exhaustive_search_triton(
+        tuned_kernel = _SILU_TUNE_CACHE.get(cache_key)
+        if tuned_kernel is None:
+            result = exhaustive_search(
                 configs,
                 stream,
                 lambda _: grid,
@@ -78,16 +166,10 @@ def _launch_silu_kernel(kernel, args, grid, cache_key, configs, launch_hints):
                 lambda config: _silu_autotune_hints(config, launch_hints),
             )
             best_hints = _silu_autotune_hints(result.best.config, launch_hints)
-            _SILU_TUNE_CACHE[cache_key] = best_hints
+            tuned_kernel = kernel if not best_hints else cached_replace_hints(kernel, **best_hints)
+            _SILU_TUNE_CACHE[cache_key] = tuned_kernel
 
-    invoke_triton_kernel(
-        stream,
-        grid,
-        kernel,
-        *args,
-        hints=best_hints,
-    )
-   #ct.launch(stream, grid, tuned_kernel, args)
+    ts.launch(stream, grid, tuned_kernel, args)
 
 
 def _silu_and_mul_forward(input_flat, output, hidden_size):
@@ -96,7 +178,7 @@ def _silu_and_mul_forward(input_flat, output, hidden_size):
     cache_key = ("fwd", hidden_size, input_flat.dtype, str(input_flat.device))
     configs, launch_hints = _silu_autotune_settings(tile_size, input_flat.dtype, input_flat.device)
 
-    if get_capability() == (10, 7):
+    if torch.cuda.get_device_capability(input_flat.device) == (10, 7):
         tile_bytes = tile_size * input_flat.dtype.itemsize
         if tile_bytes <= 8192:
             launch_hints = {"num_ctas": 1, "num_worker_warps": 4}
@@ -185,7 +267,7 @@ def silu_and_mul(
     out: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Fused SiLU and Mul operation implemented with Cutile translated.
+    Fused SiLU and Mul operation implemented with Cutile.
 
     Computes: silu(input[..., :hidden_size]) * input[..., hidden_size:]
 

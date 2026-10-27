@@ -1,3 +1,4 @@
+from . import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
@@ -8,21 +9,14 @@ from types import SimpleNamespace
 import cuda.tile as ct
 import torch
 from cuda.tile import RoundingMode as RMd
-
-from .translator import exhaustive_search_triton, get_sms, invoke_triton_kernel
+from .translator import exhaustive_search
 
 from tilegym.autotune import is_autotune_disabled
 from tilegym.backend import register_impl
 from tilegym.experimental import experimental_kernel
 
+from tilegym.ops.cutile.utils import cached_replace_hints
 from tilegym.ops.cutile.utils import next_power_of_2
-
-from tilegym.ops.cutile.softmax import (
-    _softmax_kernel,
-    _softmax_kernel_multi_wave_full_row_reg_cached_ldg,
-    _softmax_kernel_tma,
-    _softmax_kernel_chunked,
-)
 
 ConstInt = ct.Constant[int]
 
@@ -31,6 +25,164 @@ _TMA_FWD_OCCUPANCY_CANDIDATES = (2, 4, 6, 8)
 # None keeps the compiler default; worker warps above 8 can hang the gather kernels.
 _GATHER_WORKER_WARP_CANDIDATES = (None, 4, 8)
 _softmax_tune_cache: dict = {}
+
+
+@ct.kernel(occupancy=4)
+def _softmax_kernel(
+    output,
+    input,
+    N_ROWS: ConstInt,
+    TILE_SIZE: ConstInt,
+    DIM_COLS: ConstInt,
+):
+    # Static persistent scheduling: each block processes multiple rows
+    pid = ct.bid(0)
+    num_programs = ct.num_blocks(0)
+    offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
+
+    for row_idx in range(pid, N_ROWS, num_programs):
+        # Load the row tile using index-based access
+        row = ct.gather(input, (row_idx, offsets), check_bounds=True, padding_value=-math.inf)
+        # Convert to float32 for computation
+        row = ct.astype(row, ct.float32)
+
+        # Subtract maximum for numerical stability
+        row_max = ct.max(row, 0, keepdims=True)
+        row_minus_max = row - row_max
+
+        # Compute exponential
+        numerator = ct.exp(row_minus_max, rounding_mode=RMd.APPROX)
+
+        # Compute sum for normalization
+        denominator = ct.sum(numerator, 0, keepdims=True)
+
+        # Final softmax computation
+        softmax_output = ct.truediv(numerator, denominator, rounding_mode=RMd.APPROX, flush_to_zero=True)
+        softmax_output = ct.astype(softmax_output, input.dtype)
+        ct.scatter(output, (row_idx, offsets), softmax_output, check_bounds=True)
+
+
+@ct.kernel
+def _softmax_kernel_multi_wave_full_row_reg_cached_ldg(
+    output,
+    input,
+    N: ConstInt,
+    TILE_SIZE: ConstInt,
+):
+    """scheduling=multi_wave | coverage=full_row | load=ldg | caching=reg_cached
+
+    Multi-wave softmax: one block per row, no grid-stride loop.
+    Uses conditional bounds check — skipped when TILE_SIZE == N (power-of-2 N)."""
+    row_idx = ct.bid(0)
+    offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
+    check_bound = TILE_SIZE != N
+
+    row = ct.gather(input, (row_idx, offsets), check_bounds=check_bound, padding_value=-math.inf)
+    row = ct.astype(row, ct.float32)
+
+    row_max = ct.max(row, 0, keepdims=True)
+    numerator = ct.exp(row - row_max, rounding_mode=RMd.APPROX)
+    denominator = ct.sum(numerator, 0, keepdims=True)
+
+    softmax_output = ct.truediv(numerator, denominator, rounding_mode=RMd.APPROX, flush_to_zero=True)
+    softmax_output = ct.astype(softmax_output, input.dtype)
+    ct.scatter(output, (row_idx, offsets), softmax_output, check_bounds=check_bound)
+
+
+# TMA version with static persistent scheduling
+@ct.kernel(occupancy=_DEFAULT_TMA_OCCUPANCY)
+def _softmax_kernel_tma(
+    output,
+    input,
+    N_ROWS: ConstInt,
+    N_COLS: ConstInt,
+    TILE_SIZE: ConstInt,
+):
+    # Static persistent scheduling: each block processes multiple rows
+    pid = ct.bid(0)
+    num_programs = ct.num_blocks(0)
+
+    for row_idx in range(pid, N_ROWS, num_programs):
+        # Load the entire row in one tile (TILE_SIZE >= n_cols by design)
+        row = ct.load(input, index=(row_idx, 0), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.NEG_INF)
+
+        # Convert to float32 for computation
+        row = ct.astype(row, ct.float32)
+
+        # Subtract maximum for numerical stability
+        row_max = ct.max(row, 1, keepdims=True)
+        row_minus_max = row - row_max
+
+        # Compute exponential
+        numerator = ct.exp(row_minus_max, rounding_mode=RMd.APPROX)
+
+        # Compute sum for normalization
+        denominator = ct.sum(numerator, 1, keepdims=True)
+
+        # Final softmax computation
+        softmax_output = ct.truediv(numerator, denominator, rounding_mode=RMd.APPROX, flush_to_zero=True)
+
+        # Convert back to original dtype and store
+        softmax_output = ct.astype(softmax_output, input.dtype)
+        ct.store(output, index=(row_idx, 0), tile=softmax_output)
+
+
+# Chunked softmax kernel for large tensors (3-pass algorithm)
+@experimental_kernel
+@ct.kernel(occupancy=4)
+def _softmax_kernel_chunked(
+    output,
+    input,
+    N_ROWS: ConstInt,
+    N_COLS: ConstInt,
+    TILE_SIZE: ConstInt,
+):
+    # Static persistent scheduling: each block processes multiple rows
+    pid = ct.bid(0)
+    num_programs = ct.num_blocks(0)
+
+    for row_idx in range(pid, N_ROWS, num_programs):
+        row_max = ct.full((1,), -math.inf, dtype=ct.float32)
+        denominator = ct.full((1,), 0.0, dtype=ct.float32)
+        num_chunks = (N_COLS + TILE_SIZE - 1) // TILE_SIZE
+        col_offsets_base = ct.arange(TILE_SIZE, dtype=ct.int32)
+
+        # Pass 1: Find maximum
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * TILE_SIZE
+            col_indices = ct.full((TILE_SIZE,), chunk_start, dtype=ct.int32) + col_offsets_base
+            chunk = ct.gather(input, (row_idx, col_indices), check_bounds=True, padding_value=-math.inf)
+            chunk = ct.astype(chunk, ct.float32)
+            chunk_max = ct.max(chunk, 0, keepdims=True)
+            row_max = ct.maximum(row_max, chunk_max)
+
+        # Pass 2: First pass to compute denominator (sum of all exp values)
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * TILE_SIZE
+            col_indices = ct.full((TILE_SIZE,), chunk_start, dtype=ct.int32) + col_offsets_base
+            chunk = ct.gather(input, (row_idx, col_indices), check_bounds=True, padding_value=-math.inf)
+            chunk = ct.astype(chunk, ct.float32)
+            row_minus_max = chunk - row_max
+            numerator = ct.exp(row_minus_max, rounding_mode=RMd.APPROX)
+            exponentials_sum = ct.sum(numerator, 0, keepdims=True)
+            denominator = denominator + exponentials_sum
+
+        # Reciprocal once per row, multiplied inside the pass-3 chunk loop.
+        inv_denominator = ct.truediv(1.0, denominator, rounding_mode=RMd.APPROX, flush_to_zero=True)
+
+        # Pass 3: Compute final softmax
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * TILE_SIZE
+            col_indices = ct.full((TILE_SIZE,), chunk_start, dtype=ct.int32) + col_offsets_base
+            # Use gather to load chunk (returns 1D tensor like basic kernel)
+            chunk = ct.gather(input, (row_idx, col_indices), check_bounds=True, padding_value=-math.inf)
+            chunk = ct.astype(chunk, ct.float32)
+            row_minus_max = chunk - row_max
+            numerator = ct.exp(row_minus_max, rounding_mode=RMd.APPROX)
+            softmax_output = numerator * inv_denominator
+            softmax_output = ct.astype(softmax_output, input.dtype)
+            # Use scatter with bounds checking to avoid writing padded zeros
+            ct.scatter(output, (row_idx, col_indices), softmax_output, check_bounds=True)
 
 
 # Launch patterns for the kernels:
@@ -60,7 +212,7 @@ def _launch_softmax_kernel(input, output, TILE_SIZE=1024):
     input = input.contiguous()
     output = output.contiguous()
 
-    NUM_SM = get_sms()
+    NUM_SM = ts.multi_processor_count()
     num_programs = min(NUM_SM * 4, n_rows)
     grid = (num_programs, 1, 1)
     args = (output, input, n_rows, TILE_SIZE, original_n_cols)
@@ -72,9 +224,9 @@ def _launch_softmax_kernel(input, output, TILE_SIZE=1024):
         cache_key = ("gather_fwd", str(input.device), input.dtype, n_rows, original_n_cols)
         cfg = _softmax_tune_cache.get(cache_key)
         if cfg is None:
-            result = exhaustive_search_triton(
+            result = exhaustive_search(
                 candidates,
-                torch.accelerator.current_stream(input.device),
+                torch.accelerator.current_stream(),
                 lambda _: grid,
                 _softmax_kernel,
                 lambda _: args,
@@ -82,10 +234,9 @@ def _launch_softmax_kernel(input, output, TILE_SIZE=1024):
             )
             cfg = _softmax_tune_cache[cache_key] = result.best.config
     hints = _cfg_hints(cfg)
-    #softmax_kernel_forward = cached_replace_hints(_softmax_kernel, **hints) if hints else _softmax_kernel
+    softmax_kernel_forward = cached_replace_hints(_softmax_kernel, **hints) if hints else _softmax_kernel
 
-    #ct.launch(torch.cuda.current_stream(), grid, softmax_kernel_forward, args)
-    invoke_triton_kernel(torch.accelerator.current_stream(input.device), grid, _softmax_kernel, args, hints=hints)
+    ts.launch(torch.accelerator.current_stream(), grid, softmax_kernel_forward, args)
 
 
 def _launch_softmax_kernel_multi_wave_full_row_reg_cached_ldg(input, output, TILE_SIZE):
@@ -94,8 +245,8 @@ def _launch_softmax_kernel_multi_wave_full_row_reg_cached_ldg(input, output, TIL
     output = output.contiguous()
 
     grid = (n_rows, 1, 1)
-    invoke_triton_kernel(
-        torch.accelerator.current_stream(input.device),
+    ts.launch(
+        torch.accelerator.current_stream(),
         grid,
         _softmax_kernel_multi_wave_full_row_reg_cached_ldg,
         (output, input, n_cols, TILE_SIZE),
@@ -131,7 +282,7 @@ def _launch_softmax_kernel_tma(
     input = input.contiguous()
     output = output.contiguous()
 
-    NUM_SM = get_sms()
+    NUM_SM = ts.multi_processor_count()
     args = (output, input, n_rows, original_n_cols, TILE_SIZE)
     candidates = [SimpleNamespace(occupancy=o) for o in _TMA_FWD_OCCUPANCY_CANDIDATES]
     if is_autotune_disabled():
@@ -140,9 +291,9 @@ def _launch_softmax_kernel_tma(
         cache_key = ("tma_fwd", str(input.device), input.dtype, n_rows, original_n_cols)
         cfg = _softmax_tune_cache.get(cache_key)
         if cfg is None:
-            result = exhaustive_search_triton(
+            result = exhaustive_search(
                 candidates,
-                torch.accelerator.current_stream(input.device),
+                torch.accelerator.current_stream(),
                 lambda candidate: (min(NUM_SM * candidate.occupancy, n_rows), 1, 1),
                 _softmax_kernel_tma,
                 lambda _: args,
@@ -150,9 +301,10 @@ def _launch_softmax_kernel_tma(
             )
             cfg = _softmax_tune_cache[cache_key] = result.best.config
     occupancy = cfg.occupancy
+    softmax_kernel_forward = cached_replace_hints(_softmax_kernel_tma, occupancy=occupancy)
     grid = (min(NUM_SM * occupancy, n_rows), 1, 1)
 
-    invoke_triton_kernel(torch.accelerator.current_stream(input.device), grid, _softmax_kernel_tma, args, hints={"occupancy": occupancy})
+    ts.launch(torch.accelerator.current_stream(), grid, softmax_kernel_forward, args)
 
 
 def _launch_softmax_kernel_chunked(
@@ -175,12 +327,12 @@ def _launch_softmax_kernel_chunked(
     input = input.contiguous()
     output = output.contiguous()
 
-    NUM_SM = get_sms()
+    NUM_SM = ts.multi_processor_count()
     num_programs = min(NUM_SM * 4, n_rows)
     grid = (num_programs, 1, 1)
 
-    invoke_triton_kernel(
-        torch.accelerator.current_stream(input.device),
+    ts.launch(
+        torch.accelerator.current_stream(),
         grid,
         _softmax_kernel_chunked,
         (
@@ -263,10 +415,10 @@ def softmax(
     use_chunked = kwargs.get("use_chunked", False)
     use_multi_wave = kwargs.get("use_multi_wave", False)
     # Launch on x's device: the launchers use the current device's stream.
-    return _Softmax.apply(
-        x,
-        use_tma,
-        use_chunked,
-        use_multi_wave,
-    )
-
+    with torch.cuda.device(x.device):
+        return _Softmax.apply(
+            x,
+            use_tma,
+            use_chunked,
+            use_multi_wave,
+        )

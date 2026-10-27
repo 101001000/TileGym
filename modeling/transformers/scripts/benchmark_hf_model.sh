@@ -9,6 +9,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_BASELINE=1
 RUN_CUTILE=1
+RUN_TILETRANSLATION=0
 RUN_COVERAGE=1
 MODEL_KEY=""
 MODEL_ID=""
@@ -33,6 +34,7 @@ Options:
   --log-dir PATH          Profiler and nsys log directory
   --skip-baseline         Do not run PyTorch baseline
   --skip-cutile           Do not run TileGym cuTile benchmark
+  --use-tiletranslation   Also run the TileGym tiletranslation (cuTile -> Triton) benchmark
   --skip-coverage         Do not run nsys kernel coverage
   -h, --help              Show this help
 EOF
@@ -49,6 +51,7 @@ while [ "$#" -gt 0 ]; do
         --log-dir) LOG_DIR="$2"; shift 2 ;;
         --skip-baseline) RUN_BASELINE=0; shift ;;
         --skip-cutile) RUN_CUTILE=0; shift ;;
+        --use-tiletranslation) RUN_TILETRANSLATION=1; shift ;;
         --skip-coverage) RUN_COVERAGE=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1"; usage; exit 1 ;;
@@ -206,6 +209,7 @@ if [ "${RUN_BASELINE}" -eq 1 ]; then
         --model_id "${MODEL_ID}" \
         --profile \
         --log_dir "${LOG_DIR}" \
+        --show_outputs \
         --sentence_file "${INPUT_FILE}" \
         --batch_size "${BATCH_SIZE}" \
         --output_length "${OUTPUT_LENGTH}" \
@@ -219,7 +223,24 @@ if [ "${RUN_CUTILE}" -eq 1 ]; then
         --model_id "${MODEL_ID}" \
         --use_tilegym \
         --use_cutile \
+        --show_outputs \
         --use_attn \
+        --profile \
+        --log_dir "${LOG_DIR}" \
+        --sentence_file "${INPUT_FILE}" \
+        --batch_size "${BATCH_SIZE}" \
+        --output_length "${OUTPUT_LENGTH}" \
+        --summary_file "${SUMMARY_FILE}"
+fi
+
+if [ "${RUN_TILETRANSLATION}" -eq 1 ]; then
+    echo ""
+    echo "Running TileGym TILETRANSLATION backend..."
+    run_cli \
+        --model_id "${MODEL_ID}" \
+        --use_tilegym \
+        --use_tiletranslation \
+        --show_outputs \
         --profile \
         --log_dir "${LOG_DIR}" \
         --sentence_file "${INPUT_FILE}" \

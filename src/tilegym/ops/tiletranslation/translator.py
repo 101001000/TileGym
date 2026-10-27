@@ -4,6 +4,7 @@ import math
 import os
 import subprocess
 from pathlib import Path
+from contextlib import nullcontext
 
 import torch
 import triton
@@ -269,7 +270,9 @@ def prepare_triton_kernel(kernel, kernel_args, hints=None, cfg=None):
     gpu_code = get_sm_arch()
 
     cache_dir = get_cache_dir("tiletranslation", kernel_name)
-    base = cache_dir / f"{key}.{gpu_code}.{src_hash}"
+    short_key = key if len(key) <= 180 else f"{key[:90]}...{key[-90:]}"
+    key_hash = hashlib.sha1(key.encode()).hexdigest()[:16]
+    base = cache_dir / f"{short_key}.{gpu_code}.{src_hash}.{key_hash}"
 
     bytecode_path = f"{base}.tilebc"
     mlir_path = f"{base}.tileir.mlir"
@@ -283,9 +286,34 @@ def prepare_triton_kernel(kernel, kernel_args, hints=None, cfg=None):
 
     options = {"num_ctas": hints["num_ctas"]} if hints and hints.get("num_ctas") is not None else {}
     options["num_warps"] = hints["num_worker_warps"] if hints and hints.get("num_worker_warps") is not None else _recommended_num_warps(ttir_path)
+    options["num_stages"] = 1 #TODO: TRITON USES 3 BUT OOM FOR SHARED MEMORY. FIX.
     return triton.compile(ttir_path, options=options)
 
 _compiled_kernel_cache = {}
+
+
+def launch(stream, grid, kernel, kernel_args):
+    translator_cfg = None #TODO: Load config from environment
+    with stream:
+        target_hints = kernel._compiler_options.hints_by_target()
+        hints = target_hints["default"] | target_hints.get(get_sm_arch(), {})
+        cache_key = (
+            kernel,
+            stream.device,
+            get_sm_arch(),
+            _kernel_cache_key(kernel_args, hints, translator_cfg),
+        )
+        compiled = _compiled_kernel_cache.get(cache_key)
+
+        if compiled is None:
+            compiled = prepare_triton_kernel(kernel, kernel_args, hints, translator_cfg)
+            _compiled_kernel_cache[cache_key] = compiled
+
+        grid = tuple(grid) + (1,) * (3 - len(grid))
+
+        compiled[grid](*_launch_args(kernel, kernel_args))
+        return compiled
+        
 
 def invoke_triton_kernel(stream, grid, kernel, *kernel_args, hints=None, cfg=None):
     if len(kernel_args) == 1 and isinstance(kernel_args[0], tuple):
@@ -315,7 +343,10 @@ def invoke_triton_kernel(stream, grid, kernel, *kernel_args, hints=None, cfg=Non
         compiled[grid](*_launch_args(kernel, kernel_args))
         return compiled
 
-def get_sms():
+def dummy():
+    return nullcontext()
+
+def multi_processor_count():
     if torch.backends.mps.is_available():
         return torch.backends.mps.get_core_count()
     elif torch.xpu.is_available():
@@ -323,7 +354,7 @@ def get_sms():
     elif torch.cuda.is_available():
         return torch.cuda.get_device_properties(0).multi_processor_count
     else:
-        raise RuntimeError("No supported GPU backend available for get_sms")
+        raise RuntimeError("No supported GPU backend available for multi_processor_count")
 
 
 def _launch_args(kernel, kernel_args):
@@ -341,9 +372,13 @@ def _launch_args(kernel, kernel_args):
     return tuple(args)
 
 
-def exhaustive_search_triton(
-    configs, stream, grid_fn, kernel, args_fn, hints_fn, translation_cfg=None
+def exhaustive_search(
+    configs, stream, grid_fn, kernel, args_fn, hints_fn, *,
+    quiet=False,
+    single_run_timeout_sec=None,
+    flush_l2=True
 ):
+    translation_cfg = None
     best_time = float("inf")
     best_cfg = None
     best_kernel = None

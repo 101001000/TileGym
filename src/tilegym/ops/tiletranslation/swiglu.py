@@ -1,23 +1,83 @@
+from . import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
 
-"""SwiGLU forward for the tiletranslation backend.
-
-Runs the cuTile SwiGLU kernel through the cuTile -> Triton translation
-pipeline. The kernel itself lives only in the cuTile backend
-(:mod:`tilegym.ops.cutile.swiglu`) and is imported from there.
-"""
-
+import cuda.tile as ct
 import torch
+import torch.nn as nn
+from cuda.tile import RoundingMode as RMd
 
 from tilegym.backend import register_impl
+from tilegym.experimental import experimental_kernel
 
-from tilegym.ops.cutile.swiglu import _swiglu_forward_kernel
 from tilegym.ops.cutile.utils import next_power_of_2
 
-from .translator import invoke_triton_kernel
+PAD_ZERO = ct.PaddingMode.ZERO
 
+
+def _sigmoid(x):
+    denom = 1.0 + ct.exp(-x)
+    return ct.truediv(1.0, denom, flush_to_zero=True, rounding_mode=RMd.APPROX)
+
+
+def _silu(x):
+    return x * _sigmoid(x)
+
+
+@ct.kernel(occupancy=1, num_worker_warps=8)
+def _swiglu_forward_kernel(a, b, c, TILE_SIZE: ct.Constant[int], check_bounds: ct.Constant[bool]):
+    row = ct.bid(0)
+    offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
+
+    # Explicit all-true mask: required for the cuTile -> Triton translation
+    # pipeline (mlir-to-cudatilebc validation), a no-op for native cuTile.
+    mask = ct.full((TILE_SIZE,), True, dtype=ct.bool_)
+
+    a_tile = ct.gather(a, (row, offsets), mask=mask, check_bounds=check_bounds, padding_value=0.0)
+    b_tile = ct.gather(b, (row, offsets), mask=mask, check_bounds=check_bounds, padding_value=0.0)
+
+    a_tile_f32 = a_tile.astype(ct.float32)
+    c_tile = _silu(a_tile_f32).astype(a.dtype) * b_tile
+    ct.scatter(c, (row, offsets), c_tile, check_bounds=check_bounds)
+
+
+# Backward kernel for swiglu
+# Forward: c = silu(a) * b
+# da = dc * b * (sigmoid(a) + a * sigmoid(a) * (1 - sigmoid(a)))
+#    = dc * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
+# db = dc * silu(a)
+@experimental_kernel
+@ct.kernel
+def _swiglu_backward_kernel(dc, a, b, da, db, TILE_SIZE: ct.Constant[int]):
+    row = ct.bid(0)
+    col = ct.bid(1)
+
+    dc_tile = ct.load(dc, index=(row, col), shape=(1, TILE_SIZE), padding_mode=PAD_ZERO)
+    a_tile = ct.load(a, index=(row, col), shape=(1, TILE_SIZE), padding_mode=PAD_ZERO)
+    b_tile = ct.load(b, index=(row, col), shape=(1, TILE_SIZE), padding_mode=PAD_ZERO)
+
+    # Convert to float32 for precision
+    dc_tile = dc_tile.astype(ct.float32)
+    a_tile_f32 = a_tile.astype(ct.float32)
+    b_tile_f32 = b_tile.astype(ct.float32)
+
+    sigmoid_a = _sigmoid(a_tile_f32)
+    silu_a = a_tile_f32 * sigmoid_a
+
+    # db = dc * silu(a)
+    db_tile = dc_tile * silu_a
+    ct.store(db, index=(row, col), tile=db_tile.astype(a.dtype))
+
+    # da = dc * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
+    one_minus_sigmoid = 1.0 - sigmoid_a
+    silu_grad = sigmoid_a * (1.0 + a_tile_f32 * one_minus_sigmoid)
+    da_tile = dc_tile * b_tile_f32 * silu_grad
+    ct.store(da, index=(row, col), tile=da_tile.astype(a.dtype))
+
+
+def _ceildiv(a, b):
+    return -(a // -b)
 
 
 def _swiglu_forward(a, b):
@@ -37,20 +97,94 @@ def _swiglu_forward(a, b):
     # (every lane in-bounds); irregular shapes keep masking on the partial tile.
     check_bounds = TILE_SIZE != n_cols
     grid = (n_rows,)
-
-    invoke_triton_kernel(
-        torch.accelerator.current_stream(a.device),
-        (n_rows, 1, 1),
+    ts.launch(
+        torch.accelerator.current_stream(),
+        grid,
         _swiglu_forward_kernel,
-        a, b, c, TILE_SIZE, check_bounds,
+        (
+            a,
+            b,
+            c,
+            TILE_SIZE,
+            check_bounds,
+        ),
     )
-
     return c.view(*ori_shape)
 
 
+def _swiglu_backward(dc, a, b):
+    """
+    Backward pass for SwiGLU operation.
+
+    Args:
+        dc: Gradient w.r.t. output c, shape (batch_size, seq_len, intermediate_size)
+        a: Original input a (gate), same shape as dc
+        b: Original input b (up), same shape as dc
+
+    Returns:
+        Tuple of (da, db) with same shapes as inputs
+    """
+    ori_shape = dc.shape
+    n_cols = ori_shape[-1]
+    dc = dc.view(-1, n_cols).contiguous()
+    a = a.view(-1, n_cols).contiguous()
+    b = b.view(-1, n_cols).contiguous()
+    n_rows = dc.shape[0]
+
+    da = torch.empty_like(a)
+    db = torch.empty_like(b)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    TILE_N = _ceildiv(NUM_SMS, n_rows)
+    TILE_SIZE = next_power_of_2(int(n_cols / TILE_N))
+    grid = (n_rows, _ceildiv(n_cols, TILE_SIZE), 1)
+    ts.launch(
+        torch.accelerator.current_stream(),
+        grid,
+        _swiglu_backward_kernel,
+        (dc, a, b, da, db, TILE_SIZE),
+    )
+    return da.view(*ori_shape), db.view(*ori_shape)
+
+
+class _SiLUMulFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        c = _swiglu_forward(a, b)
+        ctx.save_for_backward(a, b)
+        return c
+
+    @staticmethod
+    def backward(ctx, dc):
+        a, b = ctx.saved_tensors
+        da, db = _swiglu_backward(dc, a, b)
+        return da, db
+
+
 def swiglu(a, b):
-    """SwiGLU forward via the cuTile -> Triton translation pipeline."""
-    return _swiglu_forward(a, b)
+    """Autograd-capable cuTile SwiGLU operator."""
+    return _SiLUMulFunction.apply(a, b)
+
+
+class _SwiGLUMLP(nn.Module):
+    def __init__(self, config, hidden_size=None, intermediate_size=None):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        if config.hidden_act not in ["silu", "swish"]:
+            raise ValueError(f"Activation function {config.hidden_act} not supported.")
+
+    def forward(self, x):
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
+@register_impl("get_swiglu_module", backend="tiletranslation")
+def get_swiglu_module():
+    return _SwiGLUMLP
 
 
 @register_impl("get_swiglu", backend="tiletranslation")

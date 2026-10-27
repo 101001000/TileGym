@@ -14,6 +14,9 @@ if is_backend_available("tiletranslation"):
     from . import rope
     from . import rms_norm
     from . import softmax
+    from . import recurrent_gated_delta_rule
+    from . import attention
+    from . import flash_decode
 
     # Import specific functions for direct access
     from .swiglu import get_swiglu
@@ -22,6 +25,9 @@ if is_backend_available("tiletranslation"):
     from .rms_norm import get_rms_norm_module
     from .rms_norm import rms_norm
     from .softmax import softmax
+    from .recurrent_gated_delta_rule import recurrent_gated_delta_rule
+    from .flash_decode import fmha_decode
+    from .chunk_gated_delta_rule import chunk_gated_delta_rule
 
     __all__ = [
         "swiglu",
@@ -33,6 +39,11 @@ if is_backend_available("tiletranslation"):
         "rms_norm",
         "get_rms_norm_module",
         "softmax",
+        "recurrent_gated_delta_rule",
+        "attention",
+        "fmha_decode",
+        "flash_decode",
+        "chunk_gated_delta_rule",
     ]
 else:
     __all__ = []

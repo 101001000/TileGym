@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
+from tilegym.backend import get_current_backend
 
 from tilegym.transformers.qwen3_5.kernels.causal_conv1d_prefill_silu import causal_conv1d_prefill_silu_cutile
 from tilegym.transformers.qwen3_5.kernels.causal_conv1d_update_silu import causal_conv1d_update_silu_cutile
@@ -34,6 +35,8 @@ from tilegym.transformers.qwen3_5.kernels.silu_and_mul_separate import silu_and_
 from tilegym.transformers.qwen3_5.kernels.skinny_gemm_tn_sm120 import skinny_gemm_tn_sm120_cutile
 from tilegym.transformers.qwen3_5.kernels.skinny_gemm_tn_stack_sm120 import skinny_gemm_tn_stack_sm120_cutile
 from tilegym.transformers.qwen3_5.kernels.skinny_gemm_tn_x4_sm120 import skinny_gemm_tn_x4_sm120_cutile
+
+from tilegym.transformers.qwen3_5.kernels.silu_and_mul_separate_tiletranslation import silu_and_mul_separate_tiletranslation
 
 _GROUP_GEMM_ENABLED = False
 
@@ -280,6 +283,15 @@ def _attention_forward_tilegym(
 # SwiGLU MLP
 # ──────────────────────────────────────────────────────────────────────
 
+def silu_and_mul_separate(gate, up):
+    backend = get_current_backend()
+
+    if backend == "cutile":
+        return silu_and_mul_separate_cutile(gate, up)
+    if backend == "tiletranslation":
+        return silu_and_mul_separate_tiletranslation(gate, up)
+
+    raise NotImplementedError(f"Unsupported backend: {backend}")
 
 class Qwen3_5MLPTileGym(nn.Module):
     """
@@ -304,7 +316,7 @@ class Qwen3_5MLPTileGym(nn.Module):
         gate = self.gate_proj(hidden_states)
         up = self.up_proj(hidden_states)
         if self.config.hidden_act in ("silu", "swish"):
-            hidden_states = silu_and_mul_separate_cutile(gate, up)
+            hidden_states = silu_and_mul_separate(gate, up)
         else:
             hidden_states = self.act_fn(gate) * up
         return self.down_proj(hidden_states)
