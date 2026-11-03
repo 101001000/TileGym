@@ -1,4 +1,4 @@
-from . import translator as ts
+from tilegym.ops.tiletranslation import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
@@ -138,7 +138,7 @@ def _silu_autotune_hints(config, launch_hints):
 
 def _silu_autotune_settings(tile_size, dtype, device):
     tile_bytes = tile_size * dtype.itemsize
-    capability = torch.cuda.get_device_capability(device)
+    capability = ts.get_device_capability(device)
     if tile_bytes <= 2048:
         hints = {"num_ctas": 1, "num_worker_warps": 4}
     elif tile_bytes <= 8192:
@@ -151,7 +151,7 @@ def _silu_autotune_settings(tile_size, dtype, device):
 
 
 def _launch_silu_kernel(kernel, args, grid, cache_key, configs, launch_hints):
-    stream = torch.cuda.current_stream(args[0].device)
+    stream = torch.accelerator.current_stream(args[0].device)
     if is_autotune_disabled():
         tuned_kernel = kernel
     else:
@@ -178,7 +178,7 @@ def _silu_and_mul_forward(input_flat, output, hidden_size):
     cache_key = ("fwd", hidden_size, input_flat.dtype, str(input_flat.device))
     configs, launch_hints = _silu_autotune_settings(tile_size, input_flat.dtype, input_flat.device)
 
-    if torch.cuda.get_device_capability(input_flat.device) == (10, 7):
+    if ts.get_device_capability(input_flat.device) == (10, 7):
         tile_bytes = tile_size * input_flat.dtype.itemsize
         if tile_bytes <= 8192:
             launch_hints = {"num_ctas": 1, "num_worker_warps": 4}

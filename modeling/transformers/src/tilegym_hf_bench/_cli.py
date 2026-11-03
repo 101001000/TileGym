@@ -133,8 +133,15 @@ def main(argv=None):
         NsysKernelCoverageReporter(args, raw_argv).run()
         return
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    device = torch.accelerator.current_accelerator(check_available=True)
+
+    if device is None:
+        raise RuntimeError("No supported GPU available")
+
+    device = device.type
     print(f"Using device: {device}")
+    
     print(
         f"Benchmark settings: model={args.model_id}, batch_size={args.batch_size}, output_length={args.output_length}"
     )
@@ -159,11 +166,16 @@ def main(argv=None):
 
     model_kwargs = {
         "trust_remote_code": False,
-        "device_map": "cuda",
+        "device_map": device,
         "torch_dtype": torch.bfloat16 if args.precision == "bfloat16" else torch.float32,
     }
 
     model = load_model_with_cache(args.model_id, **model_kwargs)
+
+    # XPU fails if I do not synchronize
+    model.register_forward_hook(
+        lambda _module, _inputs, _output: torch.accelerator.current_stream().synchronize()
+    )
 
     if args.show_outputs or args.profile:
         args.warmup_runs = 1
@@ -177,6 +189,7 @@ def main(argv=None):
         model,
         tokenizer=tokenizer,
         messages_list=get_messages_list(args),
+        device=model.device,
         args=args,
         pad_token_id=tokenizer.eos_token_id,
         do_sample=do_sample,
@@ -192,11 +205,11 @@ def main(argv=None):
     print(f"\nRunning benchmark with {args.num_runs} iterations...")
     generation_times = []
     tokens_per_second = []
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for run in range(args.num_runs):
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        torch.accelerator.synchronize()
+        start_event = torch.Event(enable_timing=True)
+        end_event = torch.Event(enable_timing=True)
 
         total_tokens = 0
         outputs_list = []
@@ -213,7 +226,7 @@ def main(argv=None):
         print(f"generated_tokens: {generated_tokens}")
         total_tokens += generated_tokens * args.batch_size
 
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         elapsed_time = start_event.elapsed_time(end_event) / 1000.0
         generation_times.append(elapsed_time)
         tokens_per_second.append(total_tokens / elapsed_time)

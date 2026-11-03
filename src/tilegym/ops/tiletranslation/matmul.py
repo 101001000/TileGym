@@ -1,4 +1,4 @@
-from . import translator as ts
+from tilegym.ops.tiletranslation import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
@@ -69,7 +69,7 @@ def _matmul_autotune_configs(dtype):
     """
     Iterator of autotune configurations for matmul kernel.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = ts.get_device_capability()
 
     if dtype == torch.float64 and gpu_capability in _FP64_MATMUL_CONFIGS:
         for TILE_M, TILE_N, TILE_K, num_ctas, occupancy in _FP64_MATMUL_CONFIGS[gpu_capability]:
@@ -107,7 +107,7 @@ def _static_persistent_matmul_autotune_configs(dtype):
     """
     Iterator of autotune configurations for static persistent matmul kernel.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = ts.get_device_capability()
 
     # LOAD_LATENCY = ct.load cost hint (1..10, -1 = compiler-inferred). Only sm90 tunes it
     # today; all other arches pass -1 (compiler-inferred = original behavior), but every

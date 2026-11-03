@@ -81,8 +81,11 @@ def bench_silu_and_mul(
     hidden_size,
     backend,
     datatype,
-    device="cuda",
+    device=None,
 ):
+    if device is None:
+        device = torch.accelerator.current_accelerator(check_available=True)
+        
     # Create input tensor with shape (M, 2 * hidden_size)
     # Following the formula: Silu(input[..., :hidden_size]) * input[..., hidden_size:]
     input_shape = (M, 2 * hidden_size)

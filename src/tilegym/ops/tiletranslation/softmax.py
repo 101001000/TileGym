@@ -1,4 +1,4 @@
-from . import translator as ts
+from tilegym.ops.tiletranslation import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
@@ -359,7 +359,7 @@ class _Softmax(torch.autograd.Function):
     ):
         assert not (use_tma and use_chunked), "Cannot use both TMA and chunked softmax at the same time"
         # TMA may be emulated on this arch; redirect to non-TMA path with a warning.
-        if use_tma and torch.cuda.get_device_capability(x.device)[0] < 9:
+        if use_tma and ts.get_device_capability(x.device)[0] < 9:
             import warnings
 
             warnings.warn(
@@ -415,7 +415,7 @@ def softmax(
     use_chunked = kwargs.get("use_chunked", False)
     use_multi_wave = kwargs.get("use_multi_wave", False)
     # Launch on x's device: the launchers use the current device's stream.
-    with torch.cuda.device(x.device):
+    with torch.get_device_module().device(x.device):
         return _Softmax.apply(
             x,
             use_tma,

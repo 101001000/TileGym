@@ -1,4 +1,4 @@
-from . import translator as ts
+from tilegym.ops.tiletranslation import translator as ts
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT

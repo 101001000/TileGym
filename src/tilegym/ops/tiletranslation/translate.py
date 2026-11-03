@@ -3,6 +3,24 @@ import re
 
 from pathlib import Path
 
+def pass_device_context(content):
+    return content.replace(
+        b"torch.cuda.device(",
+        b"torch.get_device_module().device(",
+    )
+
+def pass_l2_cache_size(content):
+    return content.replace(
+        b"torch.cuda.get_device_properties(0).L2_cache_size",
+        b"ts.get_l2_cache_size()",
+    )
+
+def pass_device_capability(content):
+    return content.replace(
+        b"torch.cuda.get_device_capability(",
+        b"ts.get_device_capability(",
+    )
+
 def pass_translator_import(content):
     return b"from tilegym.ops.tiletranslation import translator as ts\n" + content
 
@@ -11,8 +29,8 @@ def pass_launch(content):
 
 def pass_current_stream(content):
     return content.replace(
-        b"torch.cuda.current_stream()",
-        b"torch.accelerator.current_stream()",
+        b"torch.cuda.current_stream(",
+        b"torch.accelerator.current_stream(",
     )
 def pass_utils_import(content):
     return content.replace(
@@ -74,6 +92,9 @@ def main():
         pass_compiler_timeout,
         pass_exhaustive_search,
         pass_exhaustive_search_import,
+	pass_device_capability,
+	pass_l2_cache_size,
+	pass_device_context,
     ):
         content = transformation(content)
 

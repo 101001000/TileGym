@@ -19,9 +19,9 @@ def _ct_mm(a, b):
     Returns fp32 result (cast back from tf32) for compatibility with
     subsequent fp32 element-wise ops."""
     if a.dtype == ct.float32:
-        a = ct.astype(a, ct.tfloat32)
+        a = ct.astype(a, ct.bfloat16)
     if b.dtype == ct.float32:
-        b = ct.astype(b, ct.tfloat32)
+        b = ct.astype(b, ct.bfloat16)
     return ct.astype(ct.matmul(a, b), ct.float32)
 
 
@@ -482,7 +482,7 @@ def chunk_gated_delta_rule(
     value,
     g,
     beta,
-    chunk_size=64,
+    chunk_size=32,
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,

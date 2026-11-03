@@ -19,6 +19,7 @@ from cuda.tile._annotated_function import HomogeneousTupleNode, HeterogeneousTup
 from tilegym.ops.cache_utils import get_cache_dir
 
 DEFAULT_SM_ARCH = "sm_120"
+_pending_events = []
 
 # torch.dtype -> cuda.tile DType (covers the dtypes TileGym kernels use)
 _TORCH_TO_CT_DTYPE = {
@@ -40,6 +41,13 @@ _TORCH_TO_CT_DTYPE = {
 _INT32_MAX = 2**31 - 1
 
 
+def get_l2_cache_size(device: torch.device) -> int | None:
+    if device.type == "cuda":
+        return torch.cuda.get_device_properties(device).L2_cache_size
+    if device.type == "xpu":
+        return torch.xpu.get_device_properties(device).last_level_cache_size
+    return None
+
 def get_sm_arch() -> str:
     """Target GPU architecture for the translation pipeline.
 
@@ -50,7 +58,7 @@ def get_sm_arch() -> str:
     """
     return os.environ.get("TILEGYM_SM_ARCH", DEFAULT_SM_ARCH)
 
-def get_capability() -> tuple[int, int]:
+def get_device_capability(device=None) -> tuple[int, int]:
     sm_arch = get_sm_arch()
     capability = int(sm_arch.removeprefix("sm_"))
     return capability // 10, capability % 10
@@ -191,7 +199,6 @@ def translate_tileir(mlir_path, output_path, cfg=None):
 
     pass_name = "convert-cuda-tile-to-triton"
 
-
     if cfg is not None:
         settings = {
             "true": "plain-loads=true",
@@ -262,6 +269,7 @@ def _recommended_num_warps(ttir_path, max_warps=8, min_warps=4):
     return max(min_warps, min(max_warps, -(-max_elems // 4096)))
 
 
+
 def prepare_triton_kernel(kernel, kernel_args, hints=None, cfg=None):
     key = _kernel_cache_key(kernel_args, hints, cfg)
 
@@ -287,13 +295,42 @@ def prepare_triton_kernel(kernel, kernel_args, hints=None, cfg=None):
     options = {"num_ctas": hints["num_ctas"]} if hints and hints.get("num_ctas") is not None else {}
     options["num_warps"] = hints["num_worker_warps"] if hints and hints.get("num_worker_warps") is not None else _recommended_num_warps(ttir_path)
     options["num_stages"] = 1 #TODO: TRITON USES 3 BUT OOM FOR SHARED MEMORY. FIX.
-    return triton.compile(ttir_path, options=options)
+
+    if (
+        kernel_name == "_chunk_inter_recurrence_kernel"
+        and triton.runtime.driver.active.get_current_target().backend == "xpu"
+    ):
+        from unittest.mock import patch
+        from triton._C.libtriton import intel
+        from triton.backends.intel.compiler import XPUBackend
+
+        options["warp_size"] = 16
+
+        original_annotate_module = XPUBackend.annotate_module
+        original_make_llir = XPUBackend.make_llir
+
+        def force_genisa(cls, mod, metadata, options):
+            intel.set_is_lts(mod)
+            return original_make_llir(mod, metadata, options)
+
+        with patch.object(XPUBackend, "make_llir", classmethod(force_genisa)):
+            compiled_kernel = triton.compile(ttir_path, options=options)
+    else:
+        compiled_kernel = triton.compile(ttir_path, options=options)
+
+    Path(f"{base}.metadata.txt").write_text(str(compiled_kernel.metadata))
+    Path(f"{base}.ttgir").write_text(str(compiled_kernel.asm["ttgir"]))
+    Path(f"{base}.llir").write_text(str(compiled_kernel.asm["llir"]))
+
+    return compiled_kernel
+
 
 _compiled_kernel_cache = {}
 
 
 def launch(stream, grid, kernel, kernel_args):
     translator_cfg = None #TODO: Load config from environment
+    name = kernel._annotated_function.pyfunc.__name__
     with stream:
         target_hints = kernel._compiler_options.hints_by_target()
         hints = target_hints["default"] | target_hints.get(get_sm_arch(), {})
@@ -310,10 +347,8 @@ def launch(stream, grid, kernel, kernel_args):
             _compiled_kernel_cache[cache_key] = compiled
 
         grid = tuple(grid) + (1,) * (3 - len(grid))
-
         compiled[grid](*_launch_args(kernel, kernel_args))
         return compiled
-        
 
 def invoke_triton_kernel(stream, grid, kernel, *kernel_args, hints=None, cfg=None):
     if len(kernel_args) == 1 and isinstance(kernel_args[0], tuple):
